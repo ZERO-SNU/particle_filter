@@ -341,6 +341,10 @@ class ParticleFiler(Node):
 
         # store the necessary scanner information for later processing
         self.downsampled_ranges = np.array(msg.ranges[::self.ANGLE_STEP])
+        mid = int(len(self.downsampled_angles) / 2)
+        self.downsampled_ranges = np.concatenate(
+            (self.downsampled_ranges[mid:], self.downsampled_ranges[:mid])
+        )
         self.lidar_initialized = True
         # self.update()
 
