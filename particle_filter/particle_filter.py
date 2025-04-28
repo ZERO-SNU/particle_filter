@@ -68,6 +68,7 @@ VAR_REPEAT_ANGLES_EVAL_SENSOR_ONE_SHOT = 3
 VAR_RADIAL_CDDT_OPTIMIZATIONS = 4
 
 logger_file = open((time.strftime('/wp-%Y-%m-%d-%H-%M-%S',time.gmtime())+".csv"),'w')
+logger_file.write('# x_m,y_m,yaw_rad\n')
 
 
 class ParticleFiler(Node):
