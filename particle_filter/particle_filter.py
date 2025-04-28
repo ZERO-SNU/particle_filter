@@ -30,6 +30,7 @@ import range_libc
 import time
 from threading import Lock
 from particle_filter import utils as Utils
+import atexit
 
 # TF
 # import tf.transformations
@@ -65,6 +66,8 @@ VAR_CALC_RANGE_MANY_EVAL_SENSOR = 1
 VAR_REPEAT_ANGLES_EVAL_SENSOR = 2
 VAR_REPEAT_ANGLES_EVAL_SENSOR_ONE_SHOT = 3
 VAR_RADIAL_CDDT_OPTIMIZATIONS = 4
+
+logger_file = open((time.strftime('/wp-%Y-%m-%d-%H-%M-%S',time.gmtime())+".csv"),'w')
 
 
 class ParticleFiler(Node):
@@ -800,6 +803,9 @@ class ParticleFiler(Node):
                 self.state_lock.release()
                 t2 = time.time()
 
+                # log inferred pose (x, y, yaw)
+                logger_file.write('%f, %f, %f\n' %(self.inferred_pose[0], self.inferred_pose[1], self.inferred_pose[2]))
+
                 # publish transformation frame based on inferred pose
                 self.publish_tf(self.inferred_pose, self.last_stamp)
 
@@ -842,6 +848,9 @@ class ParticleFiler(Node):
 #                                     filter=filterx,
 #                                     interval=0.001)
 
+def shutdown():
+    print("writting log files...")
+    logger_file.close()
 
 def main(args=None):
     rclpy.init(args=args)
@@ -850,6 +859,7 @@ def main(args=None):
 
 
 if __name__ == "__main__":
+    atexit.register(shutdown)
     main()
 
 # if __name__=='__main__':
