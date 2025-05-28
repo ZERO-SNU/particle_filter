@@ -31,6 +31,7 @@ import time
 from threading import Lock
 from particle_filter import utils as Utils
 import atexit
+import os
 
 # TF
 # import tf.transformations
@@ -67,7 +68,7 @@ VAR_REPEAT_ANGLES_EVAL_SENSOR = 2
 VAR_REPEAT_ANGLES_EVAL_SENSOR_ONE_SHOT = 3
 VAR_RADIAL_CDDT_OPTIMIZATIONS = 4
 
-logger_file = open((time.strftime('/wp-%Y-%m-%d-%H-%M-%S',time.gmtime())+".csv"),'w')
+logger_file = open((os.path.expanduser("~")+time.strftime('/wp-%Y-%m-%d-%H-%M-%S',time.gmtime())+".csv"),'w')
 logger_file.write('# x_m,y_m,yaw_rad\n')
 
 
