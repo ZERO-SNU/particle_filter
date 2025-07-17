@@ -58,7 +58,7 @@ from geometry_msgs.msg import (
 )
 from nav_msgs.msg import Odometry
 from nav_msgs.srv import GetMap
-
+from ros2node.api import get_node_names # gym_bridge_launch.py 작동 시 라이다 180도 적용 코드 자동 제외
 """
 These flags indicate several variants of the sensor model. Only one of them is used at a time.
 """
@@ -181,6 +181,8 @@ class ParticleFiler(Node):
         self.particle_pub = self.create_publisher(PoseArray, "/pf/viz/particles", 1)
         self.pub_fake_scan = self.create_publisher(LaserScan, "/pf/viz/fake_scan", 1)
         self.rect_pub = self.create_publisher(PolygonStamped, "/pf/viz/poly1", 1)
+        
+        self.exec_mode = None          # "sim" 또는 "real" (처음엔 미정)
 
         if self.PUBLISH_ODOM:
             self.odom_pub = self.create_publisher(Odometry, "/pf/pose/odom", 1)
@@ -353,6 +355,20 @@ class ParticleFiler(Node):
         self.pub_fake_scan.publish(ls)
 
     def lidarCB(self, msg):
+        
+        if self.exec_mode is None:
+            self.get_logger().info('Detecting environment… (sim vs. real)')
+            probe = rclpy.create_node('probe')
+            for n in get_node_names(node=probe):
+                if n.full_name == '/ego_robot_state_publisher':
+                    self.exec_mode = 'sim'
+                    break
+            else:
+                self.exec_mode = 'real'
+            probe.destroy_node()
+            self.get_logger().info(f'Environment = {self.exec_mode.upper()}')
+        
+        
         """
         Initializes reused buffers, and stores the relevant laser scanner data for later use.
         """
@@ -374,10 +390,13 @@ class ParticleFiler(Node):
 
         # store the necessary scanner information for later processing
         self.downsampled_ranges = np.array(msg.ranges[:: self.ANGLE_STEP])
-        mid = int(len(self.downsampled_angles) / 2)
-        self.downsampled_ranges = np.concatenate(
-            (self.downsampled_ranges[mid:], self.downsampled_ranges[:mid])
+        
+        if self.exec_mode == 'real':            # 실차일 때만 180° 회전
+            mid = len(self.downsampled_angles) // 2
+            self.downsampled_ranges = np.concatenate(
+                (self.downsampled_ranges[mid:], self.downsampled_ranges[:mid])
         )
+        
         self.lidar_initialized = True
         self.update()
 
