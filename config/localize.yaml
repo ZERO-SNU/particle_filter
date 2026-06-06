@@ -1,8 +1,8 @@
 particle_filter:
   ros__parameters:
     # topic names
-    scan_topic: '/scan'
-    odometry_topic: '/odom'
+    scan_topic: "/scan"
+    odometry_topic: "/ego_racecar/odom"
     # range data downsampling
     angle_step: 18
     max_particles: 4000
@@ -11,10 +11,10 @@ particle_filter:
     viz: 1
     max_viz_particles: 60
     # ray marching method
-    range_method: 'rm'
+    range_method: "rm"
     theta_discretization: 112
     # range data filtering
-    max_range: 10
+    max_range: 15
     fine_timing: 0
     publish_odom: 1
     # sensor model constants
@@ -29,8 +29,10 @@ particle_filter:
     motion_dispersion_theta: 0.25
     # sensor model variant, variant 2 good for rmgpu, 3 doesn't work for rmgpu
     rangelib_variant: 2
+    # set true in simulator to disable 180-degree scan/TF correction
+    sim_mode: false
 
 map_server:
   ros__parameters:
     # assuming map file is in particle_filter/maps
-    map: 'hallway_0422_1'
+    map: "levine"

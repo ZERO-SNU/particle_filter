@@ -92,6 +92,7 @@ class ParticleFiler(Node):
         self.declare_parameter("fine_timing")
         self.declare_parameter("publish_odom")
         self.declare_parameter("viz")
+        self.declare_parameter("sim_mode", False)
         self.declare_parameter("z_short")
         self.declare_parameter("z_max")
         self.declare_parameter("z_rand")
@@ -115,6 +116,7 @@ class ParticleFiler(Node):
         self.SHOW_FINE_TIMING = self.get_parameter("fine_timing").value
         self.PUBLISH_ODOM = self.get_parameter("publish_odom").value
         self.DO_VIZ = self.get_parameter("viz").value
+        self.SIM_MODE = self.get_parameter("sim_mode").value
 
         # sensor model constants
         self.Z_SHORT = self.get_parameter("z_short").value
@@ -266,7 +268,11 @@ class ParticleFiler(Node):
         t.transform.translation.x = pose[0]
         t.transform.translation.y = pose[1]
         t.transform.translation.z = 0.0
-        q = tf_transformations.quaternion_from_euler(0.0, 0.0, pose[2] + 3.1415927)
+        if self.SIM_MODE:
+            yaw = pose[2]
+        else:
+            yaw = pose[2] + 3.1415927
+        q = tf_transformations.quaternion_from_euler(0.0, 0.0, yaw)
         # rotation
         t.transform.rotation.x = q[0]
         t.transform.rotation.y = q[1]
@@ -375,9 +381,10 @@ class ParticleFiler(Node):
         # store the necessary scanner information for later processing
         self.downsampled_ranges = np.array(msg.ranges[:: self.ANGLE_STEP])
         mid = int(len(self.downsampled_angles) / 2)
-        self.downsampled_ranges = np.concatenate(
-            (self.downsampled_ranges[mid:], self.downsampled_ranges[:mid])
-        )
+        if not self.SIM_MODE:
+            self.downsampled_ranges = np.concatenate(
+                (self.downsampled_ranges[mid:], self.downsampled_ranges[:mid])
+            )
         self.lidar_initialized = True
         self.update()
 
