@@ -22,7 +22,7 @@
 
 from launch import LaunchDescription
 from launch_ros.actions import Node
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch.actions import DeclareLaunchArgument
 from ament_index_python.packages import get_package_share_directory
 import os
@@ -35,13 +35,24 @@ def generate_launch_description():
         'config',
         'localize.yaml'
     )
-    localize_config_dict = yaml.safe_load(open(localize_config, 'r'))
-    map_name = localize_config_dict['map_server']['ros__parameters']['map']
     localize_la = DeclareLaunchArgument(
         'localize_config',
         default_value=localize_config,
         description='Localization configs')
-    ld = LaunchDescription([localize_la])
+
+    # 트랙 SSOT: 맵은 track_assets 패키지에서 가져온다.
+    # (localize.yaml의 map 키와 particle_filter/maps/ 는 더 이상 사용하지 않음)
+    # track:=<이름> 인자를 생략하면 track_assets/config/active_track.yaml 값 사용.
+    assets_share = get_package_share_directory('track_assets')
+    with open(os.path.join(assets_share, 'config', 'active_track.yaml'), 'r') as f:
+        default_track = yaml.safe_load(f)['active_track']
+    track_la = DeclareLaunchArgument(
+        'track',
+        default_value=default_track,
+        description='track_assets/maps/<track> 폴더 이름 (기본값: active_track.yaml)')
+    map_yaml = PathJoinSubstitution([assets_share, 'maps', LaunchConfiguration('track'), 'map.yaml'])
+
+    ld = LaunchDescription([localize_la, track_la])
 
     # nodes
     pf_node = Node(
@@ -54,7 +65,7 @@ def generate_launch_description():
         package='nav2_map_server',
         executable='map_server',
         name='map_server',
-        parameters=[{'yaml_filename': os.path.join(get_package_share_directory('particle_filter'), 'maps', map_name + '.yaml')},
+        parameters=[{'yaml_filename': map_yaml},
                     {'topic': 'map'},
                     {'frame_id': 'map'},
                     {'output': 'screen'},
