@@ -39,6 +39,10 @@ def generate_launch_description():
         'localize_config',
         default_value=localize_config,
         description='Localization configs')
+    sim_mode_la = DeclareLaunchArgument(
+        'sim_mode',
+        default_value='false',
+        description='Disable 180-degree scan/TF correction in simulation')
 
     # 트랙 SSOT: 맵은 track_assets 패키지에서 가져온다.
     # (localize.yaml의 map 키와 particle_filter/maps/ 는 더 이상 사용하지 않음)
@@ -52,14 +56,17 @@ def generate_launch_description():
         description='track_assets/maps/<track> 폴더 이름 (기본값: active_track.yaml)')
     map_yaml = PathJoinSubstitution([assets_share, 'maps', LaunchConfiguration('track'), 'map.yaml'])
 
-    ld = LaunchDescription([localize_la, track_la])
+    ld = LaunchDescription([localize_la, sim_mode_la, track_la])
 
     # nodes
     pf_node = Node(
         package='particle_filter',
         executable='particle_filter',
         name='particle_filter',
-        parameters=[LaunchConfiguration('localize_config')]
+        parameters=[
+            LaunchConfiguration('localize_config'),
+            {'sim_mode': LaunchConfiguration('sim_mode')}
+        ]
     )
     map_server_node = Node(
         package='nav2_map_server',

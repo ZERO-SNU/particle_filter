@@ -30,7 +30,6 @@ particle_filter:
     # sensor model variant, variant 2 good for rmgpu, 3 doesn't work for rmgpu
     rangelib_variant: 2
     # set true in simulator to disable 180-degree scan/TF correction
-    sim_mode: false
 
 map_server:
   ros__parameters:
