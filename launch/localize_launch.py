@@ -43,6 +43,10 @@ def generate_launch_description():
         'sim_mode',
         default_value='false',
         description='Disable 180-degree scan/TF correction in simulation')
+    use_sim_time_la = DeclareLaunchArgument(
+        'use_sim_time',
+        default_value='false',
+        description='시뮬 시계(/clock) 사용 여부 — 실차 false(기본), 시뮬은 race_launch가 true 주입')
 
     # 트랙 SSOT: 맵은 track_assets 패키지에서 가져온다.
     # (localize.yaml의 map 키와 particle_filter/maps/ 는 더 이상 사용하지 않음)
@@ -56,7 +60,7 @@ def generate_launch_description():
         description='track_assets/maps/<track> 폴더 이름 (기본값: active_track.yaml)')
     map_yaml = PathJoinSubstitution([assets_share, 'maps', LaunchConfiguration('track'), 'map.yaml'])
 
-    ld = LaunchDescription([localize_la, sim_mode_la, track_la])
+    ld = LaunchDescription([localize_la, sim_mode_la, use_sim_time_la, track_la])
 
     # nodes
     pf_node = Node(
@@ -76,14 +80,14 @@ def generate_launch_description():
                     {'topic': 'map'},
                     {'frame_id': 'map'},
                     {'output': 'screen'},
-                    {'use_sim_time': True}]
+                    {'use_sim_time': LaunchConfiguration('use_sim_time')}]
     )
     nav_lifecycle_node = Node(
         package='nav2_lifecycle_manager',
         executable='lifecycle_manager',
         name='lifecycle_manager_localization',
         output='screen',
-        parameters=[{'use_sim_time': True},
+        parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')},
                     {'autostart': True},
                     {'node_names': ['map_server']}]
     )
