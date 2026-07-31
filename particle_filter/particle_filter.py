@@ -93,6 +93,10 @@ class ParticleFiler(Node):
         self.declare_parameter("publish_odom")
         self.declare_parameter("viz")
         self.declare_parameter("sim_mode", False)
+        # 스캔 배열 반전(구 'for RPLiDAR' 코드). 이 차량(urg/Hokuyo 270° FOV)은 불필요 —
+        # 켜면 절반-스왑이 180°가 아닌 ~135° 각도 왜곡이 되어 위치추정이 발산한다 (2026-07-23 실차 사고).
+        # RPLiDAR를 180° 뒤집어 장착한 차량에서만 true.
+        self.declare_parameter("scan_rotate_180", False)
         self.declare_parameter("z_short")
         self.declare_parameter("z_max")
         self.declare_parameter("z_rand")
@@ -117,6 +121,7 @@ class ParticleFiler(Node):
         self.PUBLISH_ODOM = self.get_parameter("publish_odom").value
         self.DO_VIZ = self.get_parameter("viz").value
         self.SIM_MODE = self.get_parameter("sim_mode").value
+        self.SCAN_ROTATE_180 = self.get_parameter("scan_rotate_180").value
 
         # sensor model constants
         self.Z_SHORT = self.get_parameter("z_short").value
@@ -384,9 +389,10 @@ class ParticleFiler(Node):
 
         # store the necessary scanner information for later processing
         self.downsampled_ranges = np.array(msg.ranges[:: self.ANGLE_STEP])
-        # 실차일 때만 라이다 180° 회전. sim 판별은 sim_mode 파라미터로만 (launch가 주입).
-        is_sim = self.SIM_MODE
-        if not is_sim:
+        # 스캔 배열 반전은 sim/real이 아니라 '장착' 문제 — scan_rotate_180 파라미터로만 결정.
+        # (작동하던 차량 사본은 이 블록이 주석이었다. sim_mode에 묶었던 것은 Phase 2의 오판 —
+        #  2026-07-23 실차에서 위치추정 발산으로 확인, 기본 false = 구 차량 동작과 동일)
+        if self.SCAN_ROTATE_180:
             mid = len(self.downsampled_angles) // 2
             self.downsampled_ranges = np.concatenate(
                 (self.downsampled_ranges[mid:], self.downsampled_ranges[:mid])
