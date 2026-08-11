@@ -271,7 +271,10 @@ class ParticleFiler(Node):
         # header
         t.header.stamp = stamp
         t.header.frame_id = "/map"
-        t.child_frame_id = "/laser"
+        # Use a dedicated PF frame to avoid conflicting with the physical laser frame
+        # published by the bringup stack (base_link -> laser). This prevents TF graph
+        # ambiguity between /laser and /map->/laser sources.
+        t.child_frame_id = "/laser_pf"
         # translation
         t.transform.translation.x = pose[0]
         t.transform.translation.y = pose[1]
@@ -358,7 +361,7 @@ class ParticleFiler(Node):
         # publish the given angels and ranges as a laser scan message
         ls = LaserScan()
         ls.header.stamp = self.last_stamp
-        ls.header.frame_id = "/laser"
+        ls.header.frame_id = "/laser_pf"
         ls.angle_min = np.min(angles)
         ls.angle_max = np.max(angles)
         ls.angle_increment = np.abs(angles[0] - angles[1])
@@ -390,13 +393,17 @@ class ParticleFiler(Node):
         # store the necessary scanner information for later processing
         self.downsampled_ranges = np.array(msg.ranges[:: self.ANGLE_STEP])
         # 스캔 배열 반전은 sim/real이 아니라 '장착' 문제 — scan_rotate_180 파라미터로만 결정.
-        # (작동하던 차량 사본은 이 블록이 주석이었다. sim_mode에 묶었던 것은 Phase 2의 오판 —
-        #  2026-07-23 실차에서 위치추정 발산으로 확인, 기본 false = 구 차량 동작과 동일)
+        # 기존 구형 차량 코드에서 half-swap이 360° 스캔에만 맞으며,
+        # 270° FOV에서는 약 135°로 왜곡되어 localization을 발산시킨다.
         if self.SCAN_ROTATE_180:
-            mid = len(self.downsampled_angles) // 2
-            self.downsampled_ranges = np.concatenate(
-                (self.downsampled_ranges[mid:], self.downsampled_ranges[:mid])
-            )
+            # rotate the downsampled scan by 180° in angle space
+            angle_step = msg.angle_increment * self.ANGLE_STEP
+            shift = int(np.round(np.pi / angle_step))
+            self.downsampled_ranges = np.roll(self.downsampled_ranges, shift)
+            if not self.lidar_initialized:  # 매 스캔 로그 스팸 방지 — 최초 1회만
+                self.get_logger().info(
+                    f"scan_rotate_180: rotating downsampled scan by {shift} indices"
+                )
         self.lidar_initialized = True
         self.update()
 

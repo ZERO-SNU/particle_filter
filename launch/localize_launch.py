@@ -43,6 +43,10 @@ def generate_launch_description():
         'sim_mode',
         default_value='false',
         description='Disable 180-degree scan/TF correction in simulation')
+    scan_rotate_180_la = DeclareLaunchArgument(
+        'scan_rotate_180',
+        default_value='false',
+        description='Enable 180-degree scan array rotation for RPLiDAR-style mounting')
     use_sim_time_la = DeclareLaunchArgument(
         'use_sim_time',
         default_value='false',
@@ -69,7 +73,8 @@ def generate_launch_description():
         name='particle_filter',
         parameters=[
             LaunchConfiguration('localize_config'),
-            {'sim_mode': LaunchConfiguration('sim_mode')}
+            {'sim_mode': LaunchConfiguration('sim_mode'),
+             'scan_rotate_180': LaunchConfiguration('scan_rotate_180')}
         ]
     )
     map_server_node = Node(
