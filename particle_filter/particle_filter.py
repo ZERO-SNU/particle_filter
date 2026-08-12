@@ -279,11 +279,13 @@ class ParticleFiler(Node):
         t.transform.translation.x = pose[0]
         t.transform.translation.y = pose[1]
         t.transform.translation.z = 0.0
-        # sim에서는 pose yaw 그대로, 실차에서는 180° 보정. (sim_mode 파라미터로만 결정)
-        if self.SIM_MODE:
-            yaw = pose[2]
-        else:
-            yaw = pose[2] + 3.1415927
+        # PF 추정 yaw를 그대로 발행한다 (sim/실차 동일 — sim_mode와 무관).
+        # 과거 실차에서만 +π를 더하던 보정은 구형 차량의 라이다 180° 장착 보상이
+        # 'TF에만' 박혀 있던 것: pose 토픽(pure_pursuit 입력)은 보정 없이 나가므로
+        # PF가 180° 뒤집힌 모드로 수렴해도 RViz TF는 "옳아 보이고" 제어만 뒤집힌 채
+        # 출발하는 사고를 유발했다 (2026-08-11 car6 출발 직후 우회전 충돌).
+        # 장착 보상은 scan_rotate_180 파라미터가 담당한다. 이제 TF == pose 토픽.
+        yaw = pose[2]
         q = tf_transformations.quaternion_from_euler(0.0, 0.0, yaw)
         # rotation
         t.transform.rotation.x = q[0]
