@@ -470,12 +470,16 @@ class ParticleFiler(Node):
         ls.header.stamp = self.estimate_stamp
         # 08-17 TF 세트: /laser_pf 프레임 폐지 — 물리 laser 프레임 기준으로 발행
         ls.header.frame_id = self.LASER_FRAME
-        ls.angle_min = np.min(angles)
-        ls.angle_max = np.max(angles)
-        ls.angle_increment = np.abs(angles[0] - angles[1])
-        ls.range_min = 0
-        ls.range_max = np.max(ranges)
-        ls.ranges = ranges
+        # ROS2 메시지 setter 는 파이썬 float 만 받는다(assert isinstance(value, float)).
+        # np.min/np.max 는 입력이 float32 면 np.float32 를 돌려주는데 이는 float 서브클래스가
+        # 아니라 AssertionError 로 노드가 즉사한다. float64 면 통과하므로 배열 dtype 에 따라
+        # 재현/미재현이 갈린다 — 2026-08-19 car6 실차에서 재현됐다.
+        ls.angle_min = float(np.min(angles))
+        ls.angle_max = float(np.max(angles))
+        ls.angle_increment = float(np.abs(angles[0] - angles[1]))
+        ls.range_min = 0.0
+        ls.range_max = float(np.max(ranges))
+        ls.ranges = np.asarray(ranges, dtype=np.float32).tolist()
         self.pub_fake_scan.publish(ls)
 
     def lidarCB(self, msg):
@@ -1111,6 +1115,31 @@ class ParticleFiler(Node):
             # callback cannot reset stamp/pose between calculation and RViz.
             logger_file.write('%f, %f, %f\n' % tuple(self.inferred_pose))
             self.publish_tf(self.inferred_pose, scan_stamp, odom_to_base)
+
+            # [P0-3] 헬스 지표 발행 — 레이아웃은 pf_health.py 참조.
+            # 08-19 타임스탬프 포트로 update() 가 이 경로로 갈아끼워지면서, 아래 legacy
+            # 블록에 있던 이 계측이 `return` 뒤로 떨어져 한 번도 실행되지 않았다
+            # (publish_health:true 여도 /pf/health 메시지 0개 — 2026-08-19 car6 백에서
+            #  /pf/pose 10495 · /tf 64005 인데 /pf/health 만 0 으로 확인). 새 경로로 옮긴다.
+            if self.PUBLISH_HEALTH:
+                jump = 0.0
+                if self._health_prev_inferred is not None:
+                    jump = float(np.hypot(
+                        self.inferred_pose[0] - self._health_prev_inferred[0],
+                        self.inferred_pose[1] - self._health_prev_inferred[1]))
+                self._health_prev_inferred = np.copy(self.inferred_pose)
+                self._health_window.push(
+                    (float(self.inferred_pose[0]), float(self.inferred_pose[1]),
+                     float(self.inferred_pose[2])),
+                    (float(self.last_pose[0]), float(self.last_pose[1]),
+                     float(self.last_pose[2])))
+                scale, dyaw = self._health_window.drift()
+                m = Float32MultiArray()
+                m.data = [float(n_eff_ratio(self.weights)),
+                          float(self._health_raw_w_mean),
+                          jump, float(scale), float(dyaw)]
+                self.health_pub.publish(m)
+
             self.smoothing.append(1.0 / max(finished - started, 1e-6))
             self.visualize()
         return
