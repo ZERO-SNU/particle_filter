@@ -73,6 +73,39 @@ class DriftWindow:
         return self._pf_sum / self._odom_sum, self._yaw_sum
 
 
+class JumpGate:
+    """[P0-5] pose 점프 게이트 — 물리적으로 불가능한 추정 점프를 차단하고
+    last-good pose를 유지한다. 연속 max_holds 초과 시 새 추정을 수용
+    (진짜 재수렴/킥냅에서 옛 pose에 갇히지 않게)."""
+
+    def __init__(self, margin_m=0.5, max_holds=5):
+        self.margin_m = float(margin_m)
+        self.max_holds = int(max_holds)
+        self._last_good = None
+        self._holds = 0
+
+    def check(self, new_pose, odom_step_m):
+        """new_pose=(x,y,yaw), odom_step_m=직전 갱신 이후 odom 이동량.
+
+        반환 (채택 pose, held). held=True면 last-good을 대신 발행하라는 뜻."""
+        if self._last_good is None:
+            self._last_good = tuple(new_pose)
+            return tuple(new_pose), False
+        jump = math.hypot(new_pose[0] - self._last_good[0],
+                          new_pose[1] - self._last_good[1])
+        if jump <= abs(odom_step_m) + self.margin_m:
+            self._last_good = tuple(new_pose)
+            self._holds = 0
+            return tuple(new_pose), False
+        self._holds += 1
+        if self._holds > self.max_holds:
+            # 연속 초과 — 새 추정 수용(재수렴 간주) 후 게이트 재무장
+            self._last_good = tuple(new_pose)
+            self._holds = 0
+            return tuple(new_pose), False
+        return self._last_good, True
+
+
 def _self_test():
     # ① N_eff: 균등 → 1.0, 한 점 몰림 → 1/N
     n = 100
@@ -109,7 +142,26 @@ def _self_test():
     dw.push((1.0, 0.0, -3.1), (1.0, 0.0, -3.1))   # +π 근처 → −π 근처 (연속 회전)
     _, dy = dw.drift()
     assert abs(dy) < 1e-9
-    print("pf_health 자가 검증 5/5 통과 ✅ (N_eff·스케일·yaw잔차·창 롤링·랩핑)")
+    # ⑥ JumpGate: 정상 이동 통과
+    g = JumpGate(margin_m=0.5, max_holds=3)
+    p0, h = g.check((0.0, 0.0, 0.0), 0.0)
+    assert not h
+    p1, h = g.check((0.3, 0.0, 0.0), 0.25)      # 0.3 ≤ 0.25+0.5
+    assert not h and p1 == (0.3, 0.0, 0.0)
+    # ⑦ 점프 차단 → last-good 유지
+    p2, h = g.check((5.0, 5.0, 0.0), 0.25)
+    assert h and p2 == (0.3, 0.0, 0.0)
+    # ⑧ 연속 초과 시 수용(재수렴) 후 재무장
+    for _ in range(2):
+        p3, h = g.check((5.0, 5.0, 0.0), 0.25)
+        assert h
+    p4, h = g.check((5.0, 5.0, 0.0), 0.25)      # 4번째 = max_holds(3) 초과 → 수용
+    assert not h and p4 == (5.0, 5.0, 0.0)
+    # ⑨ 수용 후 정상 추적 재개
+    p5, h = g.check((5.2, 5.0, 0.0), 0.25)
+    assert not h and p5 == (5.2, 5.0, 0.0)
+    print("pf_health 자가 검증 9/9 통과 ✅ "
+          "(N_eff·스케일·yaw잔차·창 롤링·랩핑·게이트 통과/차단/해제/재무장)")
 
 
 if __name__ == "__main__":

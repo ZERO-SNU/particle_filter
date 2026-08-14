@@ -38,7 +38,7 @@ import os
 # import tf
 from tf2_ros import TransformBroadcaster
 import tf_transformations
-from particle_filter.pf_health import n_eff_ratio, DriftWindow
+from particle_filter.pf_health import n_eff_ratio, DriftWindow, JumpGate
 
 # messages
 from std_msgs.msg import String, Header, Float32MultiArray
@@ -111,6 +111,12 @@ class ParticleFiler(Node):
         # [P0-3] 헬스 지표 발행 — 주행 로직 무영향(발행만). Phase 3 FSM·재보정 감지 입력.
         self.declare_parameter("publish_health", True)
         self.declare_parameter("health_window_m", 5.0)
+        # [P0-5] pose 점프 게이트 — 물리 불가능 점프(odom 이동량+margin 초과) 시
+        # last-good pose를 유지 발행. false = 끔(기존 동작). 파티클·가중치는 건드리지
+        # 않음(발행 pose만 게이트) — 연속 max_holds 초과 시 새 추정 수용(재수렴 허용).
+        self.declare_parameter("jump_gate_enable", False)
+        self.declare_parameter("jump_gate_margin_m", 0.5)
+        self.declare_parameter("jump_gate_max_holds", 5)
 
         # parameters
         self.ANGLE_STEP = self.get_parameter("angle_step").value
@@ -137,6 +143,11 @@ class ParticleFiler(Node):
         # motion model constants
         self.PUBLISH_HEALTH = bool(self.get_parameter("publish_health").value)
         self._health_window = DriftWindow(float(self.get_parameter("health_window_m").value))
+        self.JUMP_GATE_ENABLE = bool(self.get_parameter("jump_gate_enable").value)
+        self._jump_gate = JumpGate(
+            float(self.get_parameter("jump_gate_margin_m").value),
+            int(self.get_parameter("jump_gate_max_holds").value))
+        self._gate_prev_odom = None
         self._health_prev_inferred = None
         self._health_raw_w_mean = 0.0
         self.MOTION_DISPERSION_X = self.get_parameter("motion_dispersion_x").value
@@ -842,6 +853,23 @@ class ParticleFiler(Node):
 
                 # compute the expected value of the robot pose
                 self.inferred_pose = self.expected_pose()
+
+                # [P0-5] pose 점프 게이트 — 발행 추정만 보정(파티클 무개입)
+                if self.JUMP_GATE_ENABLE:
+                    odom_step = 0.0
+                    if self._gate_prev_odom is not None:
+                        odom_step = float(np.hypot(
+                            self.last_pose[0] - self._gate_prev_odom[0],
+                            self.last_pose[1] - self._gate_prev_odom[1]))
+                    self._gate_prev_odom = np.copy(self.last_pose)
+                    gated, held = self._jump_gate.check(
+                        (float(self.inferred_pose[0]), float(self.inferred_pose[1]),
+                         float(self.inferred_pose[2])), odom_step)
+                    if held:
+                        self.get_logger().warn(
+                            "pose 점프 게이트: 추정 점프 차단 — last-good 유지 "
+                            "(연속 %d회)" % self._jump_gate._holds)
+                        self.inferred_pose = np.array(gated)
                 self.state_lock.release()
                 t2 = time.time()
 

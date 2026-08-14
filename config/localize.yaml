@@ -38,6 +38,11 @@ particle_filter:
     # drift_scale≠1 지속 = speed_to_erpm_gain 재보정 신호 (OPERATIONS §3-5)
     publish_health: true
     health_window_m: 5.0
+    # [P0-5] pose 점프 게이트 — false=끔(기존 동작). 켜면 물리 불가능 점프 시
+    # last-good 유지(연속 max_holds 초과 시 새 추정 수용). 실차 검증 후 기본 전환 검토.
+    jump_gate_enable: false
+    jump_gate_margin_m: 0.5
+    jump_gate_max_holds: 5
 
 map_server:
   ros__parameters:
