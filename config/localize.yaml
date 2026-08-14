@@ -4,14 +4,14 @@ particle_filter:
     scan_topic: "/scan"
     odometry_topic: "/odom"   # 정본 계약(30_SIM_REAL_PARITY §3). 시뮬은 gym launch가 /odom으로 리맵
     # range data downsampling
-    angle_step: 18
-    max_particles: 4000
-    squash_factor: 2.2
+    angle_step: 18          # [Jetson 권장 36] 빔 다운샘플 — 연산 자원 종속이라 공용 기본값 유지 (08-10 차량 실사용 36)
+    max_particles: 4000     # [Jetson 권장 7000] GPU 여유 활용 — 개발 PC(rm)는 4000 유지
+    squash_factor: 3.2      # likelihood 평탄화 (구 2.2 → 08-10 차량 실사용값)
     # visualization
     viz: 1
     max_viz_particles: 60
     # ray marching method
-    range_method: "rm"
+    range_method: "rm"      # [Jetson 전용 "rmgpu"] GPU ray marching — 개발 PC에서는 반드시 rm
     theta_discretization: 112
     # range data filtering
     max_range: 15
@@ -21,12 +21,12 @@ particle_filter:
     # 360° FOV 라이다(RPLiDAR)를 180° 돌려 장착한 차량만 true로 변경.
     # 270° FOV(urg/Hokuyo)는 반드시 false — 절반-스왑이 ~135° 왜곡이 되어 위치추정 발산 (2026-07-23 실차 사고).
     scan_rotate_180: false
-    # sensor model constants
-    z_short: 0.01
-    z_max: 0.07
-    z_rand: 0.12
-    z_hit: 0.75
-    sigma_hit: 8.0
+    # sensor model constants — 08-10 차량 실사용값 반영 (P0-3, 구값: 0.01/0.07/0.12/0.75/8.0)
+    z_short: 0.1
+    z_max: 0.05
+    z_rand: 0.05
+    z_hit: 0.8
+    sigma_hit: 3.0          # 히트 분산 좁힘 = cleaned 맵 품질 신뢰 ↑
     # motion model dispersion constants
     motion_dispersion_x: 0.05
     motion_dispersion_y: 0.025
