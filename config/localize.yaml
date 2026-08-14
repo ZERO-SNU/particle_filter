@@ -17,6 +17,9 @@ particle_filter:
     max_range: 15
     fine_timing: 0
     publish_odom: 1
+    # [차량별 장착 설정] 스캔 배열 180° 반전 (구 'for RPLiDAR' 블록).
+    # 360° FOV 라이다(RPLiDAR)를 180° 돌려 장착한 차량만 true로 변경.
+    # 270° FOV(urg/Hokuyo)는 반드시 false — 절반-스왑이 ~135° 왜곡이 되어 위치추정 발산 (2026-07-23 실차 사고).
     scan_rotate_180: false
     # sensor model constants
     z_short: 0.01
@@ -30,7 +33,6 @@ particle_filter:
     motion_dispersion_theta: 0.25
     # sensor model variant, variant 2 good for rmgpu, 3 doesn't work for rmgpu
     rangelib_variant: 2
-    # set true in simulator to disable 180-degree scan/TF correction
 
 map_server:
   ros__parameters:
