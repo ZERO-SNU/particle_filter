@@ -38,6 +38,7 @@ import os
 # import tf
 from tf2_ros import TransformBroadcaster
 import tf_transformations
+from particle_filter.pf_health import n_eff_ratio, DriftWindow
 
 # messages
 from std_msgs.msg import String, Header, Float32MultiArray
@@ -107,6 +108,9 @@ class ParticleFiler(Node):
         self.declare_parameter("motion_dispersion_theta")
         self.declare_parameter("scan_topic")
         self.declare_parameter("odometry_topic")
+        # [P0-3] 헬스 지표 발행 — 주행 로직 무영향(발행만). Phase 3 FSM·재보정 감지 입력.
+        self.declare_parameter("publish_health", True)
+        self.declare_parameter("health_window_m", 5.0)
 
         # parameters
         self.ANGLE_STEP = self.get_parameter("angle_step").value
@@ -131,6 +135,10 @@ class ParticleFiler(Node):
         self.SIGMA_HIT = self.get_parameter("sigma_hit").value
 
         # motion model constants
+        self.PUBLISH_HEALTH = bool(self.get_parameter("publish_health").value)
+        self._health_window = DriftWindow(float(self.get_parameter("health_window_m").value))
+        self._health_prev_inferred = None
+        self._health_raw_w_mean = 0.0
         self.MOTION_DISPERSION_X = self.get_parameter("motion_dispersion_x").value
         self.MOTION_DISPERSION_Y = self.get_parameter("motion_dispersion_y").value
         self.MOTION_DISPERSION_THETA = self.get_parameter(
@@ -199,6 +207,9 @@ class ParticleFiler(Node):
         self.pub_tf = TransformBroadcaster(self)
 
         # these topics are to receive data from the racecar
+        # [P0-3] 헬스 지표 발행자
+        if self.PUBLISH_HEALTH:
+            self.health_pub = self.create_publisher(Float32MultiArray, "/pf/health", 1)
         self.laser_sub = self.create_subscription(
             LaserScan, self.get_parameter("scan_topic").value, self.lidarCB, 1
         )
@@ -778,6 +789,7 @@ class ParticleFiler(Node):
             t_sensor = time.time()
 
         # normalize importance weights
+        self._health_raw_w_mean = float(np.mean(self.weights))   # [P0-3] 정규화 전 평균 likelihood
         self.weights /= np.sum(self.weights)
         if self.SHOW_FINE_TIMING:
             t_norm = time.time()
@@ -838,6 +850,26 @@ class ParticleFiler(Node):
 
                 # publish transformation frame based on inferred pose
                 self.publish_tf(self.inferred_pose, self.last_stamp)
+
+                # [P0-3] 헬스 지표 발행 — 레이아웃은 pf_health.py 참조
+                if self.PUBLISH_HEALTH:
+                    jump = 0.0
+                    if self._health_prev_inferred is not None:
+                        jump = float(np.hypot(
+                            self.inferred_pose[0] - self._health_prev_inferred[0],
+                            self.inferred_pose[1] - self._health_prev_inferred[1]))
+                    self._health_prev_inferred = np.copy(self.inferred_pose)
+                    self._health_window.push(
+                        (float(self.inferred_pose[0]), float(self.inferred_pose[1]),
+                         float(self.inferred_pose[2])),
+                        (float(self.last_pose[0]), float(self.last_pose[1]),
+                         float(self.last_pose[2])))
+                    scale, dyaw = self._health_window.drift()
+                    m = Float32MultiArray()
+                    m.data = [float(n_eff_ratio(self.weights)),
+                              float(self._health_raw_w_mean),
+                              jump, float(scale), float(dyaw)]
+                    self.health_pub.publish(m)
 
                 # this is for tracking particle filter speed
                 ips = 1.0 / (t2 - t1)
