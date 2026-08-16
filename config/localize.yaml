@@ -31,7 +31,10 @@ particle_filter:
     motion_dispersion_x: 0.05
     motion_dispersion_y: 0.025
     motion_dispersion_theta: 0.25
-    # sensor model variant, variant 2 good for rmgpu, 3 doesn't work for rmgpu
+    # sensor model variant. 2 = raycast 후 CPU likelihood (전 방식 공통 동작).
+    # [Jetson 권장 3] 3 = fused GPU(raycast+likelihood+reduction 원샷, rmgpu 전용) —
+    #   fused 지원 .so(scripts/install_rangelib_orin_sm87.sh) 필요, 미지원이면 기동 시 2로 자동 강등.
+    #   08-15 car1 실차 검증: 처리율 +30%, update 3.77 ms (PARAMS.md §particle_filter)
     rangelib_variant: 2
     # [P0-3] 헬스 지표 (/pf/health Float32MultiArray) — 레이아웃: pf_health.py
     # [n_eff_ratio, mean_likelihood, pose_jump_m, drift_scale, drift_yaw_rad]
