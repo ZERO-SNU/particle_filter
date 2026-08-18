@@ -25,6 +25,7 @@ import rclpy
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 
 # libraries
 import numpy as np
@@ -190,6 +191,10 @@ class ParticleFiler(Node):
         self._last_latency_log = 0.0
         self.first_sensor_update = True
         self.state_lock = Lock()
+        # The GPU scan callback can run continuously.  Keep RViz initial-pose
+        # delivery on the executor's second thread; the existing particle
+        # initialization itself remains serialized by state_lock.
+        self.manual_reset_group = MutuallyExclusiveCallbackGroup()
 
         # cache this to avoid memory allocation in motion model
         self.local_deltas = np.zeros((self.MAX_PARTICLES, 3))
@@ -283,10 +288,12 @@ class ParticleFiler(Node):
             Odometry, self.get_parameter("odometry_topic").value, self.odomCB2, 1
         )
         self.pose_sub = self.create_subscription(
-            PoseWithCovarianceStamped, "/initialpose", self.clicked_pose, 1
+            PoseWithCovarianceStamped, "/initialpose", self.clicked_pose, 1,
+            callback_group=self.manual_reset_group
         )
         self.click_sub = self.create_subscription(
-            PointStamped, "/clicked_point", self.clicked_pose, 1
+            PointStamped, "/clicked_point", self.clicked_pose, 1,
+            callback_group=self.manual_reset_group
         )
 
         self.get_logger().info("Finished initializing, waiting on messages...")
@@ -617,11 +624,14 @@ class ParticleFiler(Node):
         """
         Initialize particles in the general region of the provided pose.
         """
-        self._reset_scan_epoch()
         self.get_logger().info("SETTING POSE")
         self.get_logger().info(str([pose.position.x, pose.position.y]))
         yaw = Utils.quaternion_to_angle(pose.orientation)
         with self.state_lock:
+            # This is the original direct RViz seed: no frame conversion or
+            # artificial hold.  Lock the whole reset/publication transaction
+            # so a scan cannot overwrite it halfway through.
+            self._reset_scan_epoch()
             self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
             self.particles[:, 0] = pose.position.x + np.random.normal(
                 loc=0.0, scale=0.5, size=self.MAX_PARTICLES
@@ -631,30 +641,30 @@ class ParticleFiler(Node):
             )
             self.particles[:, 2] = yaw + np.random.normal(
                 loc=0.0, scale=0.4, size=self.MAX_PARTICLES)
-        # A manual RViz estimate is an explicit operator reset, not a scan
-        # projection.  Show it immediately using the freshest available
-        # odom->laser transform; normal PF/dynamic-map processing still uses
-        # exact scan timestamps only.
-        self.inferred_pose = np.array([
-            pose.position.x,
-            pose.position.y,
-            yaw])
-        try:
-            odom_to_laser = self.tf_buffer.lookup_transform(
-                'odom', self.LASER_FRAME, rclpy.time.Time(),
-                timeout=Duration(seconds=self.TF_LOOKUP_TIMEOUT))
-        except TransformException as ex:
-            self.get_logger().warn(
-                '2D Pose Estimate stored, but odom -> laser is unavailable: %s' % ex)
-            return
-        self.estimate_stamp = odom_to_laser.header.stamp
-        # This latest-TF lookup is isolated to the explicit operator reset.
-        # Do not publish operational pose/odom until an exact scan epoch has
-        # produced the matching PF/map snapshot.
-        self.publish_tf(
-            self.inferred_pose, self.estimate_stamp, odom_to_laser,
-            publish_odom=False)
-        self.visualize(publish_operational_pose=False)
+            # A manual RViz estimate is an explicit operator reset, not a scan
+            # projection.  Show it immediately using the freshest available
+            # odom->laser transform; normal PF/dynamic-map processing still
+            # uses exact scan timestamps only.
+            self.inferred_pose = np.array([
+                pose.position.x,
+                pose.position.y,
+                yaw])
+            try:
+                odom_to_laser = self.tf_buffer.lookup_transform(
+                    'odom', self.LASER_FRAME, rclpy.time.Time(),
+                    timeout=Duration(seconds=self.TF_LOOKUP_TIMEOUT))
+            except TransformException as ex:
+                self.get_logger().warn(
+                    '2D Pose Estimate stored, but odom -> laser is unavailable: %s' % ex)
+                return
+            self.estimate_stamp = odom_to_laser.header.stamp
+            # This latest-TF lookup is isolated to the explicit operator reset.
+            # Do not publish operational pose/odom until an exact scan epoch has
+            # produced the matching PF/map snapshot.
+            self.publish_tf(
+                self.inferred_pose, self.estimate_stamp, odom_to_laser,
+                publish_odom=False)
+            self.visualize(publish_operational_pose=False)
 
     def initialize_global(self):
         """
@@ -1104,10 +1114,12 @@ class ParticleFiler(Node):
                 if held:
                     self.inferred_pose = np.array(gated)
             finished = time.time()
-        logger_file.write('%f, %f, %f\n' % tuple(self.inferred_pose))
-        self.publish_tf(self.inferred_pose, scan_stamp, odom_to_laser)
-        self.smoothing.append(1.0 / max(finished - started, 1e-6))
-        self.visualize()
+            # Keep outputs in the same transaction as MCL so the manual
+            # callback cannot reset stamp/pose between calculation and RViz.
+            logger_file.write('%f, %f, %f\n' % tuple(self.inferred_pose))
+            self.publish_tf(self.inferred_pose, scan_stamp, odom_to_laser)
+            self.smoothing.append(1.0 / max(finished - started, 1e-6))
+            self.visualize()
         return
 
         # Legacy arrival-order implementation retained below only as reference.
