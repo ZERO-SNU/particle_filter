@@ -1202,10 +1202,15 @@ class ParticleFiler(Node):
                 if held:
                     self.inferred_pose = np.array(gated)
             finished = time.time()
-        logger_file.write('%f, %f, %f\n' % tuple(self.inferred_pose))
-        self.publish_tf(self.inferred_pose, scan_stamp, odom_to_laser)
-        self.smoothing.append(1.0 / max(finished - started, 1e-6))
-        self.visualize()
+            # A manual RViz reset runs in a separate callback group so it can
+            # be received under scan load.  Keep this scan's complete output
+            # transaction under the same lock: otherwise a reset could clear
+            # estimate_stamp between MCL and visualize(), producing a Header
+            # type assertion or a mixed-epoch TF/pose publication.
+            logger_file.write('%f, %f, %f\n' % tuple(self.inferred_pose))
+            self.publish_tf(self.inferred_pose, scan_stamp, odom_to_laser)
+            self.smoothing.append(1.0 / max(finished - started, 1e-6))
+            self.visualize()
         return
 
         # Legacy arrival-order implementation retained below only as reference.
