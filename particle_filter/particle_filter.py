@@ -25,6 +25,7 @@ import rclpy
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 
 # libraries
 import numpy as np
@@ -197,6 +198,10 @@ class ParticleFiler(Node):
         self.manual_laser_pose = None
         self.manual_map_to_odom = None
         self.manual_initialization_until = 0.0
+        # RViz relocalization must not wait behind a continuous GPU scan
+        # callback.  It gets its own executor group; particle mutation is
+        # still serialized by state_lock below.
+        self.manual_reset_group = MutuallyExclusiveCallbackGroup()
         self.first_sensor_update = True
         self.state_lock = Lock()
 
@@ -292,10 +297,12 @@ class ParticleFiler(Node):
             Odometry, self.get_parameter("odometry_topic").value, self.odomCB2, 1
         )
         self.pose_sub = self.create_subscription(
-            PoseWithCovarianceStamped, "/initialpose", self.clicked_pose, 1
+            PoseWithCovarianceStamped, "/initialpose", self.clicked_pose, 1,
+            callback_group=self.manual_reset_group
         )
         self.click_sub = self.create_subscription(
-            PointStamped, "/clicked_point", self.clicked_pose, 1
+            PointStamped, "/clicked_point", self.clicked_pose, 1,
+            callback_group=self.manual_reset_group
         )
 
         self.get_logger().info("Finished initializing, waiting on messages...")
@@ -600,6 +607,7 @@ class ParticleFiler(Node):
         if isinstance(msg, PointStamped):
             self.initialize_global()
         elif isinstance(msg, PoseWithCovarianceStamped):
+            self.get_logger().info('Received RViz 2D Pose Estimate')
             frame = msg.header.frame_id.lstrip('/')
             pose = msg.pose.pose
             values = np.array([
@@ -671,11 +679,15 @@ class ParticleFiler(Node):
         """
         Initialize particles in the general region of the provided pose.
         """
-        self._reset_scan_epoch()
         self.get_logger().info("SETTING POSE")
         self.get_logger().info(str([pose.position.x, pose.position.y]))
         yaw = Utils.quaternion_to_angle(pose.orientation)
         with self.state_lock:
+            # This lock is also held while MCL updates the cloud.  A manual
+            # reset therefore cannot be partially overwritten by an in-flight
+            # scan callback, even though its subscription has a separate
+            # executor callback group.
+            self._reset_scan_epoch()
             self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
             self.particles[:, 0] = pose.position.x + np.random.normal(
                 loc=0.0, scale=0.5, size=self.MAX_PARTICLES
@@ -689,13 +701,13 @@ class ParticleFiler(Node):
         # projection.  Show it immediately using the freshest available
         # odom->laser transform; normal PF/dynamic-map processing still uses
         # exact scan timestamps only.
-        self.inferred_pose = np.array([
-            pose.position.x,
-            pose.position.y,
-            yaw])
-        self.manual_laser_pose = np.copy(self.inferred_pose)
-        self.manual_initialization_until = (
-            time.monotonic() + self.MANUAL_INITIALIZATION_HOLD_SECONDS)
+            self.inferred_pose = np.array([
+                pose.position.x,
+                pose.position.y,
+                yaw])
+            self.manual_laser_pose = np.copy(self.inferred_pose)
+            self.manual_initialization_until = (
+                time.monotonic() + self.MANUAL_INITIALIZATION_HOLD_SECONDS)
         self.get_logger().info(
             '2D Pose Estimate reset: holding PF scan/odom updates for %.1f s; '
             'then localizing around the clicked pose' %
