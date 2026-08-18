@@ -120,9 +120,19 @@ def test_manual_pose_reset_discards_old_motion_and_health_baselines():
 
 def test_clicked_pose_accepts_only_valid_map_pose():
     accepted = []
+    transform = TransformStamped()
+    transform.transform.translation.x = 0.165
+    transform.transform.rotation.z = 1.0
+    transform.transform.rotation.w = 0.0
     fake = SimpleNamespace(
         clock_epoch_latch=SimpleNamespace(faulted=False),
+        BASE_FRAME='base_link',
+        LASER_FRAME='laser',
+        TF_LOOKUP_TIMEOUT=0.05,
+        tf_buffer=SimpleNamespace(
+            lookup_transform=lambda *_args, **_kwargs: transform),
         get_logger=lambda: Logger(),
+        base_pose_to_laser_pose=ParticleFiler.base_pose_to_laser_pose,
         initialize_particles_pose=lambda pose: accepted.append(pose),
     )
     message = PoseWithCovarianceStamped()
@@ -131,11 +141,31 @@ def test_clicked_pose_accepts_only_valid_map_pose():
     message.pose.pose.orientation.w = 1.0
 
     ParticleFiler.clicked_pose(fake, message)
-    assert accepted == [message.pose.pose]
+    assert len(accepted) == 1
+    assert np.isclose(accepted[0].position.x, 1.165)
+    assert np.isclose(accepted[0].orientation.z, 1.0)
 
     message.header.frame_id = 'odom'
     ParticleFiler.clicked_pose(fake, message)
-    assert accepted == [message.pose.pose]
+    assert len(accepted) == 1
+
+
+def test_initial_pose_converts_vehicle_heading_to_laser_heading():
+    base_pose = Pose()
+    base_pose.position.x = 1.0
+    base_pose.position.y = 2.0
+    base_pose.orientation.w = 1.0
+    base_to_laser = TransformStamped()
+    base_to_laser.transform.translation.x = 0.165
+    base_to_laser.transform.rotation.z = 1.0
+    base_to_laser.transform.rotation.w = 0.0
+
+    laser_pose = ParticleFiler.base_pose_to_laser_pose(base_pose, base_to_laser)
+
+    assert np.isclose(laser_pose.position.x, 1.165)
+    assert np.isclose(laser_pose.position.y, 2.0)
+    assert np.isclose(laser_pose.orientation.z, 1.0)
+    assert np.isclose(laser_pose.orientation.w, 0.0, atol=1e-6)
 
 
 def test_manual_pose_cannot_clear_latched_clock_fault():

@@ -113,6 +113,7 @@ class ParticleFiler(Node):
         self.declare_parameter("scan_topic")
         self.declare_parameter("odometry_topic")
         self.declare_parameter("laser_frame", "laser")
+        self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("tf_lookup_timeout", 0.05)
         self.declare_parameter("max_future_stamp", 0.05)
         self.declare_parameter("clock_reset_threshold", 1.0)
@@ -141,6 +142,7 @@ class ParticleFiler(Node):
         self.SIM_MODE = self.get_parameter("sim_mode").value
         self.SCAN_ROTATE_180 = self.get_parameter("scan_rotate_180").value
         self.LASER_FRAME = str(self.get_parameter("laser_frame").value)
+        self.BASE_FRAME = str(self.get_parameter("base_frame").value)
         self.TF_LOOKUP_TIMEOUT = float(self.get_parameter("tf_lookup_timeout").value)
         self.MAX_FUTURE_STAMP = float(self.get_parameter("max_future_stamp").value)
         self.clock_epoch_latch = ClockEpochLatch(
@@ -603,10 +605,44 @@ class ParticleFiler(Node):
                 self.get_logger().error(
                     'Ignoring 2D Pose Estimate with a non-finite or invalid pose')
                 return
+            # RViz publishes map->base_link.  PF's sensor model estimates
+            # map->laser; this vehicle's static base_link->laser has yaw pi.
+            # Seed in laser coordinates so an RViz forward arrow is not
+            # interpreted as a rear-facing LiDAR heading.
+            try:
+                base_to_laser = self.tf_buffer.lookup_transform(
+                    self.BASE_FRAME, self.LASER_FRAME, rclpy.time.Time(),
+                    timeout=Duration(seconds=self.TF_LOOKUP_TIMEOUT))
+            except TransformException as ex:
+                self.get_logger().warn(
+                    'Ignoring 2D Pose Estimate until %s -> %s is available: %s' %
+                    (self.BASE_FRAME, self.LASER_FRAME, ex))
+                return
+            pose = self.base_pose_to_laser_pose(pose, base_to_laser)
             self.get_logger().info(
-                '2D Pose Estimate accepted; RViz will update immediately and '
-                '/pf/pose will resume on the next exact scan')
+                '2D Pose Estimate accepted as map->%s seed; RViz arrow was '
+                'map->%s' % (self.LASER_FRAME, self.BASE_FRAME))
             self.initialize_particles_pose(pose)
+
+    @staticmethod
+    def base_pose_to_laser_pose(base_pose, base_to_laser):
+        """Compose RViz map->base_link input with static base_link->laser."""
+        q = base_pose.orientation
+        base_yaw = tf_transformations.euler_from_quaternion(
+            [q.x, q.y, q.z, q.w])[2]
+        tf_q = base_to_laser.transform.rotation
+        laser_offset_yaw = tf_transformations.euler_from_quaternion(
+            [tf_q.x, tf_q.y, tf_q.z, tf_q.w])[2]
+        offset = base_to_laser.transform.translation
+        laser_pose = Pose()
+        laser_pose.position.x = base_pose.position.x + (
+            np.cos(base_yaw) * offset.x - np.sin(base_yaw) * offset.y)
+        laser_pose.position.y = base_pose.position.y + (
+            np.sin(base_yaw) * offset.x + np.cos(base_yaw) * offset.y)
+        laser_pose.position.z = base_pose.position.z + offset.z
+        laser_pose.orientation = Utils.angle_to_quaternion(
+            base_yaw + laser_offset_yaw)
+        return laser_pose
 
     def _reset_scan_epoch(self):
         """A manual relocalization must not reuse motion from the old pose."""
