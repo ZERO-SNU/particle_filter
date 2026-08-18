@@ -42,7 +42,6 @@ def test_operational_pose_is_published_when_visualization_is_disabled():
         DO_VIZ=False,
         pose_pub=Recorder(),
         legacy_pose_pub=Recorder(),
-        laser_pose_to_base_pose=lambda pose: pose,
     )
 
     ParticleFiler.visualize(fake)
@@ -167,18 +166,6 @@ def test_initial_pose_converts_vehicle_heading_to_laser_heading():
     assert np.isclose(laser_pose.position.y, 2.0)
     assert np.isclose(laser_pose.orientation.z, 1.0)
     assert np.isclose(laser_pose.orientation.w, 0.0, atol=1e-6)
-
-
-def test_operational_pose_converts_laser_heading_back_to_vehicle_heading():
-    base_to_laser = TransformStamped()
-    base_to_laser.transform.translation.x = 0.165
-    base_to_laser.transform.rotation.z = 1.0
-    base_to_laser.transform.rotation.w = 0.0
-
-    base_pose = ParticleFiler.laser_pose_to_base_pose_with_tf(
-        np.array([1.165, 2.0, np.pi]), base_to_laser)
-
-    assert np.allclose(base_pose, [1.0, 2.0, 0.0], atol=1e-6)
 
 
 def test_manual_pose_cannot_clear_latched_clock_fault():

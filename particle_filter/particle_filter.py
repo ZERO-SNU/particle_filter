@@ -190,7 +190,6 @@ class ParticleFiler(Node):
         self.last_motion_tf = None
         self.last_motion_stamp_ns = 0
         self._last_tf_warning = 0.0
-        self._last_base_tf_warning = 0.0
         self._last_latency_log = 0.0
         self.first_sensor_update = True
         self.state_lock = Lock()
@@ -409,15 +408,12 @@ class ParticleFiler(Node):
         self.pub_tf.sendTransform(t)
         # also publish odometry to facilitate getting the localization pose
         if self.PUBLISH_ODOM and publish_odom:
-            base_pose = self.laser_pose_to_base_pose(pose)
-            if base_pose is None:
-                return
             odom = Odometry()
             odom.header.stamp = stamp
             odom.header.frame_id = "map"
-            odom.pose.pose.position.x = base_pose[0]
-            odom.pose.pose.position.y = base_pose[1]
-            odom.pose.pose.orientation = Utils.angle_to_quaternion(base_pose[2])
+            odom.pose.pose.position.x = pose[0]
+            odom.pose.pose.position.y = pose[1]
+            odom.pose.pose.orientation = Utils.angle_to_quaternion(pose[2])
             cov_mat = np.cov(
                 self.particles, rowvar=False, ddof=0, aweights=self.weights
             ).flatten()
@@ -436,20 +432,12 @@ class ParticleFiler(Node):
         pose stamp for which lattice has no obstacle-map snapshot.
         """
         if isinstance(self.inferred_pose, np.ndarray):
-            # PF's sensor model lives at the physical LiDAR origin.  Every
-            # driving consumer, however, expects the vehicle-body pose.
-            # Convert map->laser to map->base_link before publishing /pf/pose
-            # or RViz's inferred-pose marker; otherwise a rear-facing laser
-            # makes the car appear to drive backward.
-            base_pose = self.laser_pose_to_base_pose(self.inferred_pose)
-            if base_pose is None:
-                return
             ps = PoseStamped()
             ps.header.stamp = self.estimate_stamp
             ps.header.frame_id = "map"
-            ps.pose.position.x = base_pose[0]
-            ps.pose.position.y = base_pose[1]
-            ps.pose.orientation = Utils.angle_to_quaternion(base_pose[2])
+            ps.pose.position.x = self.inferred_pose[0]
+            ps.pose.position.y = self.inferred_pose[1]
+            ps.pose.orientation = Utils.angle_to_quaternion(self.inferred_pose[2])
             if publish_operational_pose:
                 # Never subscription-gate operational state.
                 self.pose_pub.publish(ps)
@@ -655,36 +643,6 @@ class ParticleFiler(Node):
         laser_pose.orientation = Utils.angle_to_quaternion(
             base_yaw + laser_offset_yaw)
         return laser_pose
-
-    @staticmethod
-    def laser_pose_to_base_pose_with_tf(laser_pose, base_to_laser):
-        """Convert the PF's map->laser state to the vehicle-body pose."""
-        tf_q = base_to_laser.transform.rotation
-        base_to_laser_yaw = tf_transformations.euler_from_quaternion(
-            [tf_q.x, tf_q.y, tf_q.z, tf_q.w])[2]
-        base_yaw = laser_pose[2] - base_to_laser_yaw
-        offset = base_to_laser.transform.translation
-        return np.array([
-            laser_pose[0] - (
-                np.cos(base_yaw) * offset.x - np.sin(base_yaw) * offset.y),
-            laser_pose[1] - (
-                np.sin(base_yaw) * offset.x + np.cos(base_yaw) * offset.y),
-            base_yaw,
-        ])
-
-    def laser_pose_to_base_pose(self, laser_pose):
-        try:
-            base_to_laser = self.tf_buffer.lookup_transform(
-                self.BASE_FRAME, self.LASER_FRAME, rclpy.time.Time(),
-                timeout=Duration(seconds=self.TF_LOOKUP_TIMEOUT))
-        except TransformException as ex:
-            if time.monotonic() - self._last_base_tf_warning >= 1.0:
-                self.get_logger().warn(
-                    'Cannot publish PF vehicle pose until %s -> %s is available: %s' %
-                    (self.BASE_FRAME, self.LASER_FRAME, ex))
-                self._last_base_tf_warning = time.monotonic()
-            return None
-        return self.laser_pose_to_base_pose_with_tf(laser_pose, base_to_laser)
 
     def _reset_scan_epoch(self):
         """A manual relocalization must not reuse motion from the old pose."""
