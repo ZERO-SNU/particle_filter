@@ -46,6 +46,7 @@ from particle_filter.time_sync import ClockEpochLatch, relative_planar_motion
 
 # messages
 from std_msgs.msg import String, Header, Float32MultiArray
+from builtin_interfaces.msg import Time
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker
 from geometry_msgs.msg import (
@@ -438,6 +439,14 @@ class ParticleFiler(Node):
         ``/initialpose`` may update RViz immediately, but must not inject a
         pose stamp for which lattice has no obstacle-map snapshot.
         """
+        # Never let an operator reset or a clock-reset transition turn into a
+        # process crash in the visualization path.  The next valid scan will
+        # supply a proper builtin_interfaces/Time stamp again.
+        if not isinstance(self.estimate_stamp, Time):
+            self.get_logger().warn(
+                'Skipping PF visualization without a valid estimate timestamp')
+            return
+
         if isinstance(self.inferred_pose, np.ndarray):
             ps = PoseStamped()
             ps.header.stamp = self.estimate_stamp
@@ -634,10 +643,12 @@ class ParticleFiler(Node):
                     (self.BASE_FRAME, self.LASER_FRAME, ex))
                 return
             laser_pose = self.base_pose_to_laser_pose(pose, base_to_laser)
+            base_yaw = Utils.quaternion_to_angle(pose.orientation)
+            laser_yaw = Utils.quaternion_to_angle(laser_pose.orientation)
             self.get_logger().info(
-                '2D Pose Estimate accepted as map -> %s; RViz will update '
-                'immediately and /pf/pose will resume on the next exact scan' %
-                self.BASE_FRAME)
+                '2D Pose Estimate accepted: map->%s yaw %.3f rad, '
+                'map->%s yaw %.3f rad; /pf/pose resumes on the next exact scan' %
+                (self.BASE_FRAME, base_yaw, self.LASER_FRAME, laser_yaw))
             self.initialize_particles_pose(laser_pose)
 
     @staticmethod

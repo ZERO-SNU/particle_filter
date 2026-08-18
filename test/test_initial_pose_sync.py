@@ -52,6 +52,22 @@ def test_operational_pose_is_published_when_visualization_is_disabled():
     assert fake.legacy_pose_pub.messages == []
 
 
+def test_visualize_never_crashes_without_a_timestamp_during_reset():
+    fake = SimpleNamespace(
+        inferred_pose=np.array([1.0, 2.0, 0.3]),
+        estimate_stamp=None,
+        DO_VIZ=True,
+        pose_pub=Recorder(),
+        legacy_pose_pub=Recorder(),
+        get_logger=lambda: Logger(),
+    )
+
+    ParticleFiler.visualize(fake)
+
+    assert fake.pose_pub.messages == []
+    assert fake.legacy_pose_pub.messages == []
+
+
 def test_manual_pose_updates_tf_but_not_scan_synchronized_outputs():
     transform = TransformStamped()
     transform.header.stamp = Time(sec=20, nanosec=50)
