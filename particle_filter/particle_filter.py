@@ -112,6 +112,7 @@ class ParticleFiler(Node):
         self.declare_parameter("scan_topic")
         self.declare_parameter("odometry_topic")
         self.declare_parameter("laser_frame", "laser")
+        self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("tf_lookup_timeout", 0.05)
         self.declare_parameter("max_future_stamp", 0.05)
         self.declare_parameter("clock_reset_threshold", 1.0)
@@ -140,6 +141,7 @@ class ParticleFiler(Node):
         self.SIM_MODE = self.get_parameter("sim_mode").value
         self.SCAN_ROTATE_180 = self.get_parameter("scan_rotate_180").value
         self.LASER_FRAME = str(self.get_parameter("laser_frame").value)
+        self.BASE_FRAME = str(self.get_parameter("base_frame").value)
         self.TF_LOOKUP_TIMEOUT = float(self.get_parameter("tf_lookup_timeout").value)
         self.MAX_FUTURE_STAMP = float(self.get_parameter("max_future_stamp").value)
         self.clock_epoch_latch = ClockEpochLatch(
@@ -188,6 +190,8 @@ class ParticleFiler(Node):
         self.last_motion_stamp_ns = 0
         self._last_tf_warning = 0.0
         self._last_latency_log = 0.0
+        self.manual_laser_pose = None
+        self.manual_map_to_odom = None
         self.first_sensor_update = True
         self.state_lock = Lock()
 
@@ -412,7 +416,7 @@ class ParticleFiler(Node):
             odom.twist.twist.linear.x = self.current_speed
             self.odom_pub.publish(odom)
 
-        return
+        return t
 
     def visualize(self, publish_operational_pose=True):
         """
@@ -567,6 +571,7 @@ class ParticleFiler(Node):
         if not self.odom_initialized:
             self.get_logger().info("...Received first Odometry message CB2")
         self.odom_initialized = True
+        self._refresh_manual_map_to_odom(msg.header.stamp)
 
     def clicked_pose(self, msg):
         """
@@ -596,10 +601,41 @@ class ParticleFiler(Node):
                 self.get_logger().error(
                     'Ignoring 2D Pose Estimate with a non-finite or invalid pose')
                 return
+            try:
+                base_to_laser = self.tf_buffer.lookup_transform(
+                    self.BASE_FRAME, self.LASER_FRAME, rclpy.time.Time(),
+                    timeout=Duration(seconds=self.TF_LOOKUP_TIMEOUT))
+            except TransformException as ex:
+                self.get_logger().warn(
+                    '2D Pose Estimate ignored until %s -> %s is available: %s' %
+                    (self.BASE_FRAME, self.LASER_FRAME, ex))
+                return
+            laser_pose = self.base_pose_to_laser_pose(pose, base_to_laser)
             self.get_logger().info(
-                '2D Pose Estimate accepted; RViz will update immediately and '
-                '/pf/pose will resume on the next exact scan')
-            self.initialize_particles_pose(pose)
+                '2D Pose Estimate accepted as map -> %s; RViz will update '
+                'immediately and /pf/pose will resume on the next exact scan' %
+                self.BASE_FRAME)
+            self.initialize_particles_pose(laser_pose)
+
+    @staticmethod
+    def base_pose_to_laser_pose(base_pose, base_to_laser):
+        """Compose RViz map->base pose with the static base->laser transform."""
+        q = base_pose.orientation
+        base_yaw = tf_transformations.euler_from_quaternion(
+            [q.x, q.y, q.z, q.w])[2]
+        tf_q = base_to_laser.transform.rotation
+        laser_offset_yaw = tf_transformations.euler_from_quaternion(
+            [tf_q.x, tf_q.y, tf_q.z, tf_q.w])[2]
+        offset = base_to_laser.transform.translation
+        laser_pose = Pose()
+        laser_pose.position.x = base_pose.position.x + (
+            np.cos(base_yaw) * offset.x - np.sin(base_yaw) * offset.y)
+        laser_pose.position.y = base_pose.position.y + (
+            np.sin(base_yaw) * offset.x + np.cos(base_yaw) * offset.y)
+        laser_pose.position.z = base_pose.position.z + offset.z
+        laser_pose.orientation = Utils.angle_to_quaternion(
+            base_yaw + laser_offset_yaw)
+        return laser_pose
 
     def _reset_scan_epoch(self):
         """A manual relocalization must not reuse motion from the old pose."""
@@ -607,6 +643,8 @@ class ParticleFiler(Node):
         self.last_motion_stamp_ns = 0
         self.estimate_stamp = None
         self.inferred_pose = None
+        self.manual_laser_pose = None
+        self.manual_map_to_odom = None
         self._health_prev_inferred = None
         self._gate_prev_odom = None
         self._jump_gate = JumpGate(
@@ -639,6 +677,7 @@ class ParticleFiler(Node):
             pose.position.x,
             pose.position.y,
             yaw])
+        self.manual_laser_pose = np.copy(self.inferred_pose)
         try:
             odom_to_laser = self.tf_buffer.lookup_transform(
                 'odom', self.LASER_FRAME, rclpy.time.Time(),
@@ -651,10 +690,30 @@ class ParticleFiler(Node):
         # This latest-TF lookup is isolated to the explicit operator reset.
         # Do not publish operational pose/odom until an exact scan epoch has
         # produced the matching PF/map snapshot.
-        self.publish_tf(
+        self.manual_map_to_odom = self.publish_tf(
             self.inferred_pose, self.estimate_stamp, odom_to_laser,
             publish_odom=False)
         self.visualize(publish_operational_pose=False)
+
+    def _refresh_manual_map_to_odom(self, odom_stamp):
+        """Keep manual RViz localization visible until the first PF scan."""
+        if self.manual_laser_pose is None:
+            return
+        if self.manual_map_to_odom is None:
+            try:
+                odom_to_laser = self.tf_buffer.lookup_transform(
+                    'odom', self.LASER_FRAME, rclpy.time.Time(),
+                    timeout=Duration(seconds=self.TF_LOOKUP_TIMEOUT))
+            except TransformException:
+                return
+            self.estimate_stamp = odom_to_laser.header.stamp
+            self.manual_map_to_odom = self.publish_tf(
+                self.manual_laser_pose, self.estimate_stamp, odom_to_laser,
+                publish_odom=False)
+            self.visualize(publish_operational_pose=False)
+            return
+        self.manual_map_to_odom.header.stamp = odom_stamp
+        self.pub_tf.sendTransform(self.manual_map_to_odom)
 
     def initialize_global(self):
         """
@@ -1089,6 +1148,8 @@ class ParticleFiler(Node):
             self.MCL(action, observation)
             self.inferred_pose = self.expected_pose()
             self.estimate_stamp = scan_stamp
+            self.manual_laser_pose = None
+            self.manual_map_to_odom = None
             self.last_motion_tf = odom_to_laser
             self.last_motion_stamp_ns = scan_ns
             q = odom_to_laser.transform.rotation
