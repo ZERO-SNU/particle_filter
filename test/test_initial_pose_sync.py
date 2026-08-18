@@ -140,25 +140,6 @@ def test_clicked_pose_accepts_only_valid_map_pose():
     assert len(accepted) == 1
 
 
-def test_sensor_model_converts_base_particles_to_rear_laser_queries():
-    base_to_laser = TransformStamped()
-    base_to_laser.transform.translation.x = 0.165
-    base_to_laser.transform.rotation.z = 1.0
-    base_to_laser.transform.rotation.w = 0.0
-    fake = SimpleNamespace(
-        _sensor_particles=np.empty((1, 3)),
-        _sensor_offset_x=0.0,
-        _sensor_offset_y=0.0,
-        _sensor_offset_yaw=0.0,
-    )
-
-    ParticleFiler.set_sensor_extrinsics(fake, base_to_laser)
-    sensor_pose = ParticleFiler.base_particles_to_sensor(
-        fake, np.array([[1.0, 2.0, 0.0]]))
-
-    assert np.allclose(sensor_pose[0], [1.165, 2.0, np.pi], atol=1e-6)
-
-
 def test_manual_pose_cannot_clear_latched_clock_fault():
     accepted = []
     fake = SimpleNamespace(

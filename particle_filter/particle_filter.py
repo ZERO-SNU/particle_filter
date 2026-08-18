@@ -221,12 +221,6 @@ class ParticleFiler(Node):
         self._resample_positions = np.empty(self.MAX_PARTICLES, dtype=np.float64)
         self._resample_cdf = np.empty(self.MAX_PARTICLES, dtype=np.float64)
         self._resample_particles = np.empty_like(self.particles)
-        # Particles are map->base_link.  RangeLib queries are generated at the
-        # physical laser origin using the static base_link->laser extrinsics.
-        self._sensor_particles = np.empty_like(self.particles)
-        self._sensor_offset_x = 0.0
-        self._sensor_offset_y = 0.0
-        self._sensor_offset_yaw = 0.0
 
         # initialize the state
         self.smoothing = Utils.CircularArray(10)
@@ -454,19 +448,11 @@ class ParticleFiler(Node):
         if self.pub_fake_scan.get_subscription_count() > 0 and isinstance(
             self.ranges, np.ndarray
         ):
-            # Generate the fake scan at the physical laser origin, while the
-            # inferred PF pose remains the vehicle-body pose.
-            base_yaw = self.inferred_pose[2]
-            laser_x = self.inferred_pose[0] + (
-                np.cos(base_yaw) * self._sensor_offset_x -
-                np.sin(base_yaw) * self._sensor_offset_y)
-            laser_y = self.inferred_pose[1] + (
-                np.sin(base_yaw) * self._sensor_offset_x +
-                np.cos(base_yaw) * self._sensor_offset_y)
-            laser_yaw = base_yaw + self._sensor_offset_yaw
-            self.viz_queries[:, 0] = laser_x
-            self.viz_queries[:, 1] = laser_y
-            self.viz_queries[:, 2] = self.downsampled_angles + laser_yaw
+            # Preserve the proven vehicle-pose sensor convention used by the
+            # existing map/scan calibration.
+            self.viz_queries[:, 0] = self.inferred_pose[0]
+            self.viz_queries[:, 1] = self.inferred_pose[1]
+            self.viz_queries[:, 2] = self.downsampled_angles + self.inferred_pose[2]
             self.range_method.calc_range_many(self.viz_queries, self.viz_ranges)
             self.publish_scan(self.downsampled_angles, self.viz_ranges)
 
@@ -779,28 +765,6 @@ class ParticleFiler(Node):
             loc=0.0, scale=self.MOTION_DISPERSION_THETA, size=self.MAX_PARTICLES
         )
 
-    def set_sensor_extrinsics(self, base_to_laser):
-        self._sensor_offset_x = base_to_laser.transform.translation.x
-        self._sensor_offset_y = base_to_laser.transform.translation.y
-        q = base_to_laser.transform.rotation
-        self._sensor_offset_yaw = tf_transformations.euler_from_quaternion(
-            [q.x, q.y, q.z, q.w])[2]
-
-    def base_particles_to_sensor(self, base_particles):
-        """Return map->laser queries for map->base_link particles."""
-        headings = base_particles[:, 2]
-        cosines = np.cos(headings)
-        sines = np.sin(headings)
-        self._sensor_particles[:, 0] = base_particles[:, 0] + (
-            cosines * self._sensor_offset_x -
-            sines * self._sensor_offset_y)
-        self._sensor_particles[:, 1] = base_particles[:, 1] + (
-            sines * self._sensor_offset_x +
-            cosines * self._sensor_offset_y)
-        self._sensor_particles[:, 2] = (
-            headings + self._sensor_offset_yaw)
-        return self._sensor_particles
-
     def sensor_model(self, proposal_dist, obs, weights):
         """
         This function computes a probablistic weight for each particle in the proposal distribution.
@@ -817,7 +781,10 @@ class ParticleFiler(Node):
         """
 
         num_rays = self.downsampled_angles.shape[0]
-        sensor_dist = self.base_particles_to_sensor(proposal_dist)
+        # Existing map/scan calibration treats particle heading as the raycast
+        # heading.  Do not add the static laser yaw here: doing so applies pi
+        # twice and flips the estimate on the first scan after /initialpose.
+        sensor_dist = proposal_dist
         # only allocate buffers once to avoid slowness
         if self.first_sensor_update:
             if self.RANGELIB_VAR <= 1:
@@ -1105,14 +1072,11 @@ class ParticleFiler(Node):
             odom_to_base = self.tf_buffer.lookup_transform(
                 'odom', self.BASE_FRAME, rclpy.time.Time.from_msg(scan_stamp),
                 timeout=Duration(seconds=self.TF_LOOKUP_TIMEOUT))
-            base_to_laser = self.tf_buffer.lookup_transform(
-                self.BASE_FRAME, self.LASER_FRAME, rclpy.time.Time(),
-                timeout=Duration(seconds=self.TF_LOOKUP_TIMEOUT))
         except TransformException as ex:
             if time.monotonic() - self._last_tf_warning >= 1.0:
                 self.get_logger().warn(
-                    'Skipping PF scan: odom -> base_link or base_link -> laser '
-                    'transform unavailable: %s' % ex)
+                    'Skipping PF scan: exact odom -> base_link transform '
+                    'unavailable: %s' % ex)
                 self._last_tf_warning = time.monotonic()
             return
         action = np.zeros(3)
@@ -1121,7 +1085,6 @@ class ParticleFiler(Node):
         if self.state_lock.locked():
             return
         with self.state_lock:
-            self.set_sensor_extrinsics(base_to_laser)
             self.timer.tick()
             self.iters += 1
             started = time.time()
