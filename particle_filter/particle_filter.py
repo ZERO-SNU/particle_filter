@@ -36,7 +36,7 @@ import os
 # TF
 # import tf.transformations
 # import tf
-from tf2_ros import TransformBroadcaster
+from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
 import tf_transformations
 from particle_filter.pf_health import n_eff_ratio, DriftWindow, JumpGate
 
@@ -248,6 +248,9 @@ class ParticleFiler(Node):
             self.odom_pub = self.create_publisher(Odometry, "/pf/pose/odom", 1)
 
         # these topics are for coordinate space things
+        # [08-17 TF 세트] map→odom 합성에 필요한 odom→laser 실시간 lookup
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         self.pub_tf = TransformBroadcaster(self)
 
         # these topics are to receive data from the racecar
@@ -318,31 +321,52 @@ class ParticleFiler(Node):
         self.map_initialized = True
 
     def publish_tf(self, pose, stamp=None):
-        """Publish a tf for the car. This tells ROS where the car is with respect to the map."""
+        """Publish map -> odom from the laser pose estimated by the particle filter.
+
+        [08-17 TF 세트 채택 — origin/path-planning ad9564d, car1 실차 검증: RViz 벽 방향
+        이상 해소 + 정상 주행 확인] PF는 map 기준 laser pose를 추정한다. odom->base_link
+        (vesc)와 base_link->laser(static, yaw π = 후향 장착 표현)가 이미 차량을 국소
+        기술하므로, 여기서 map->laser를 직접 쏘면 laser의 TF 부모가 둘이 된다(구 /laser_pf
+        분리 방식의 원인). 대신 map->laser 추정을 실시간 odom->laser의 역과 합성해
+        map->odom 하나만 발행한다 — 표준 REP-105 체인 완성.
+        pose 토픽(pure_pursuit·lattice 입력)은 이 변경과 무관하게 원값 그대로다.
+        """
         if stamp == None:
             stamp = self.get_clock().now().to_msg()
 
+        # MCL은 LaserScan 프레임 자체의 pose를 추정한다. 후향 장착은 static
+        # base_link->laser TF(π)가 표현하므로 여기서 또 180° 보정하면 이중 적용이 된다.
+        laser_yaw = pose[2]
+
+        try:
+            odom_to_laser = self.tf_buffer.lookup_transform(
+                'odom', 'laser', rclpy.time.Time.from_msg(stamp))
+        except TransformException as ex:
+            self.get_logger().warn(
+                'Cannot publish map -> odom until odom -> laser is available: %s' % ex)
+            return
+
+        q = odom_to_laser.transform.rotation
+        odom_laser_yaw = tf_transformations.euler_from_quaternion(
+            [q.x, q.y, q.z, q.w])[2]
+        map_odom_yaw = laser_yaw - odom_laser_yaw
+        odom_laser_x = odom_to_laser.transform.translation.x
+        odom_laser_y = odom_to_laser.transform.translation.y
+
         t = TransformStamped()
-        # header
         t.header.stamp = stamp
-        t.header.frame_id = "/map"
-        # Use a dedicated PF frame to avoid conflicting with the physical laser frame
-        # published by the bringup stack (base_link -> laser). This prevents TF graph
-        # ambiguity between /laser and /map->/laser sources.
-        t.child_frame_id = "/laser_pf"
-        # translation
-        t.transform.translation.x = pose[0]
-        t.transform.translation.y = pose[1]
+        t.header.frame_id = 'map'
+        t.child_frame_id = 'odom'
+        # T_map_odom = T_map_laser * inverse(T_odom_laser).
+        # 평면: p_map_odom = p_map_laser - R_map_odom p_odom_laser.
+        t.transform.translation.x = pose[0] - (
+            np.cos(map_odom_yaw) * odom_laser_x -
+            np.sin(map_odom_yaw) * odom_laser_y)
+        t.transform.translation.y = pose[1] - (
+            np.sin(map_odom_yaw) * odom_laser_x +
+            np.cos(map_odom_yaw) * odom_laser_y)
         t.transform.translation.z = 0.0
-        # PF 추정 yaw를 그대로 발행한다 (sim/실차 동일 — sim_mode와 무관).
-        # 과거 실차에서만 +π를 더하던 보정은 구형 차량의 라이다 180° 장착 보상이
-        # 'TF에만' 박혀 있던 것: pose 토픽(pure_pursuit 입력)은 보정 없이 나가므로
-        # PF가 180° 뒤집힌 모드로 수렴해도 RViz TF는 "옳아 보이고" 제어만 뒤집힌 채
-        # 출발하는 사고를 유발했다 (2026-08-11 car6 출발 직후 우회전 충돌).
-        # 장착 보상은 scan_rotate_180 파라미터가 담당한다. 이제 TF == pose 토픽.
-        yaw = pose[2]
-        q = tf_transformations.quaternion_from_euler(0.0, 0.0, yaw)
-        # rotation
+        q = tf_transformations.quaternion_from_euler(0.0, 0.0, map_odom_yaw)
         t.transform.rotation.x = q[0]
         t.transform.rotation.y = q[1]
         t.transform.rotation.z = q[2]
@@ -418,7 +442,8 @@ class ParticleFiler(Node):
         # publish the given angels and ranges as a laser scan message
         ls = LaserScan()
         ls.header.stamp = self.last_stamp
-        ls.header.frame_id = "/laser_pf"
+        # 08-17 TF 세트: /laser_pf 프레임 폐지 — 물리 laser 프레임 기준으로 발행
+        ls.header.frame_id = "/laser"
         ls.angle_min = np.min(angles)
         ls.angle_max = np.max(angles)
         ls.angle_increment = np.abs(angles[0] - angles[1])
