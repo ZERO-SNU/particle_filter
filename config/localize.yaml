@@ -3,6 +3,10 @@ particle_filter:
     # topic names
     scan_topic: "/scan"
     odometry_topic: "/odom"   # 정본 계약(30_SIM_REAL_PARITY §3). 시뮬은 gym launch가 /odom으로 리맵
+    laser_frame: "laser"
+    tf_lookup_timeout: 0.05
+    max_future_stamp: 0.05
+    clock_reset_threshold: 1.0
     # range data downsampling
     angle_step: 18          # [Jetson 권장 36] 빔 다운샘플 — 연산 자원 종속이라 공용 기본값 유지 (08-10 차량 실사용 36)
     max_particles: 4000     # [Jetson 권장 7000] GPU 여유 활용 — 개발 PC(rm)는 4000 유지

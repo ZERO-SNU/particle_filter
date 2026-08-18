@@ -22,6 +22,8 @@
 
 # ros2 python
 import rclpy
+from rclpy.duration import Duration
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 # libraries
@@ -39,6 +41,7 @@ import os
 from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
 import tf_transformations
 from particle_filter.pf_health import n_eff_ratio, DriftWindow, JumpGate
+from particle_filter.time_sync import ClockEpochLatch, relative_planar_motion
 
 # messages
 from std_msgs.msg import String, Header, Float32MultiArray
@@ -108,6 +111,10 @@ class ParticleFiler(Node):
         self.declare_parameter("motion_dispersion_theta")
         self.declare_parameter("scan_topic")
         self.declare_parameter("odometry_topic")
+        self.declare_parameter("laser_frame", "laser")
+        self.declare_parameter("tf_lookup_timeout", 0.05)
+        self.declare_parameter("max_future_stamp", 0.05)
+        self.declare_parameter("clock_reset_threshold", 1.0)
         # [P0-3] 헬스 지표 발행 — 주행 로직 무영향(발행만). Phase 3 FSM·재보정 감지 입력.
         self.declare_parameter("publish_health", True)
         self.declare_parameter("health_window_m", 5.0)
@@ -132,6 +139,11 @@ class ParticleFiler(Node):
         self.DO_VIZ = self.get_parameter("viz").value
         self.SIM_MODE = self.get_parameter("sim_mode").value
         self.SCAN_ROTATE_180 = self.get_parameter("scan_rotate_180").value
+        self.LASER_FRAME = str(self.get_parameter("laser_frame").value)
+        self.TF_LOOKUP_TIMEOUT = float(self.get_parameter("tf_lookup_timeout").value)
+        self.MAX_FUTURE_STAMP = float(self.get_parameter("max_future_stamp").value)
+        self.clock_epoch_latch = ClockEpochLatch(
+            float(self.get_parameter("clock_reset_threshold").value))
 
         # sensor model constants
         self.Z_SHORT = self.get_parameter("z_short").value
@@ -171,6 +183,11 @@ class ParticleFiler(Node):
         self.range_method = None
         self.last_time = None
         self.last_stamp = None
+        self.estimate_stamp = None
+        self.last_motion_tf = None
+        self.last_motion_stamp_ns = 0
+        self._last_tf_warning = 0.0
+        self._last_latency_log = 0.0
         self.first_sensor_update = True
         self.state_lock = Lock()
 
@@ -236,7 +253,9 @@ class ParticleFiler(Node):
 
         # Pub Subs
         # these topics are for visualization
-        self.pose_pub = self.create_publisher(PoseStamped, "/pf/viz/inferred_pose", 1)
+        self.pose_pub = self.create_publisher(PoseStamped, "/pf/pose", 1)
+        self.legacy_pose_pub = self.create_publisher(
+            PoseStamped, "/pf/viz/inferred_pose", 1)
         self.particle_pub = self.create_publisher(PoseArray, "/pf/viz/particles", 1)
         self.pub_fake_scan = self.create_publisher(LaserScan, "/pf/viz/fake_scan", 1)
         self.rect_pub = self.create_publisher(PolygonStamped, "/pf/viz/poly1", 1)
@@ -320,7 +339,8 @@ class ParticleFiler(Node):
         self.permissible_region[array_255 == 0] = 1
         self.map_initialized = True
 
-    def publish_tf(self, pose, stamp=None):
+    def publish_tf(self, pose, stamp=None, odom_to_laser=None,
+                   publish_odom=True):
         """Publish map -> odom from the laser pose estimated by the particle filter.
 
         [08-17 TF 세트 채택 — origin/path-planning ad9564d, car1 실차 검증: RViz 벽 방향
@@ -331,20 +351,25 @@ class ParticleFiler(Node):
         map->odom 하나만 발행한다 — 표준 REP-105 체인 완성.
         pose 토픽(pure_pursuit·lattice 입력)은 이 변경과 무관하게 원값 그대로다.
         """
-        if stamp == None:
+        if self.clock_epoch_latch.faulted:
+            return
+        if stamp is None:
             stamp = self.get_clock().now().to_msg()
 
         # MCL은 LaserScan 프레임 자체의 pose를 추정한다. 후향 장착은 static
         # base_link->laser TF(π)가 표현하므로 여기서 또 180° 보정하면 이중 적용이 된다.
         laser_yaw = pose[2]
 
-        try:
-            odom_to_laser = self.tf_buffer.lookup_transform(
-                'odom', 'laser', rclpy.time.Time.from_msg(stamp))
-        except TransformException as ex:
-            self.get_logger().warn(
-                'Cannot publish map -> odom until odom -> laser is available: %s' % ex)
-            return
+        if odom_to_laser is None:
+            try:
+                odom_to_laser = self.tf_buffer.lookup_transform(
+                    'odom', self.LASER_FRAME,
+                    rclpy.time.Time.from_msg(stamp),
+                    timeout=Duration(seconds=self.TF_LOOKUP_TIMEOUT))
+            except TransformException as ex:
+                self.get_logger().warn(
+                    'Cannot publish map -> odom until scan-time odom -> laser is available: %s' % ex)
+                return
 
         q = odom_to_laser.transform.rotation
         odom_laser_yaw = tf_transformations.euler_from_quaternion(
@@ -373,10 +398,10 @@ class ParticleFiler(Node):
         t.transform.rotation.w = q[3]
         self.pub_tf.sendTransform(t)
         # also publish odometry to facilitate getting the localization pose
-        if self.PUBLISH_ODOM:
+        if self.PUBLISH_ODOM and publish_odom:
             odom = Odometry()
-            odom.header.stamp = self.get_clock().now().to_msg()
-            odom.header.frame_id = "/map"
+            odom.header.stamp = stamp
+            odom.header.frame_id = "map"
             odom.pose.pose.position.x = pose[0]
             odom.pose.pose.position.y = pose[1]
             odom.pose.pose.orientation = Utils.angle_to_quaternion(pose[2])
@@ -389,24 +414,29 @@ class ParticleFiler(Node):
 
         return
 
-    def visualize(self):
+    def visualize(self, publish_operational_pose=True):
         """
         Publish various visualization messages.
-        """
-        if not self.DO_VIZ:
-            return
 
-        if self.pose_pub.get_subscription_count() > 0 and isinstance(
-            self.inferred_pose, np.ndarray
-        ):
-            # Publish the inferred pose for visualization
+        ``/pf/pose`` is an operational, scan-synchronized topic.  A manual
+        ``/initialpose`` may update RViz immediately, but must not inject a
+        pose stamp for which lattice has no obstacle-map snapshot.
+        """
+        if isinstance(self.inferred_pose, np.ndarray):
             ps = PoseStamped()
-            ps.header.stamp = self.get_clock().now().to_msg()
-            ps.header.frame_id = "/map"
+            ps.header.stamp = self.estimate_stamp
+            ps.header.frame_id = "map"
             ps.pose.position.x = self.inferred_pose[0]
             ps.pose.position.y = self.inferred_pose[1]
             ps.pose.orientation = Utils.angle_to_quaternion(self.inferred_pose[2])
-            self.pose_pub.publish(ps)
+            if publish_operational_pose:
+                # Never subscription-gate operational state.
+                self.pose_pub.publish(ps)
+            if self.DO_VIZ:
+                self.legacy_pose_pub.publish(ps)
+
+        if not self.DO_VIZ:
+            return
 
         if self.particle_pub.get_subscription_count() > 0:
             # publish a downsampled version of the particle distribution to avoid a lot of latency
@@ -433,17 +463,17 @@ class ParticleFiler(Node):
     def publish_particles(self, particles):
         # publish the given particles as a PoseArray object
         pa = PoseArray()
-        pa.header.stamp = self.get_clock().now().to_msg()
-        pa.header.frame_id = "/map"
+        pa.header.stamp = self.estimate_stamp
+        pa.header.frame_id = "map"
         pa.poses = Utils.particles_to_poses(particles)
         self.particle_pub.publish(pa)
 
     def publish_scan(self, angles, ranges):
         # publish the given angels and ranges as a laser scan message
         ls = LaserScan()
-        ls.header.stamp = self.last_stamp
+        ls.header.stamp = self.estimate_stamp
         # 08-17 TF 세트: /laser_pf 프레임 폐지 — 물리 laser 프레임 기준으로 발행
-        ls.header.frame_id = "/laser"
+        ls.header.frame_id = self.LASER_FRAME
         ls.angle_min = np.min(angles)
         ls.angle_max = np.max(angles)
         ls.angle_increment = np.abs(angles[0] - angles[1])
@@ -456,6 +486,11 @@ class ParticleFiler(Node):
         """
         Initializes reused buffers, and stores the relevant laser scanner data for later use.
         """
+        if msg.header.frame_id.lstrip('/') != self.LASER_FRAME:
+            self.get_logger().warn(
+                "Skipping scan frame '%s'; expected '%s'" % (
+                    msg.header.frame_id, self.LASER_FRAME))
+            return
         if not isinstance(self.laser_angles, np.ndarray):
             self.get_logger().info("...Received first LiDAR message")
             self.laser_angles = np.linspace(
@@ -487,7 +522,7 @@ class ParticleFiler(Node):
                     f"scan_rotate_180: rotating downsampled scan by {shift} indices"
                 )
         self.lidar_initialized = True
-        self.update()
+        self.update(msg.header.stamp)
 
     def odomCB(self, msg):
         """
@@ -522,65 +557,110 @@ class ParticleFiler(Node):
 
     def odomCB2(self, msg):
         """
-        odom callback for slow lidar
-        update weight and estimate pose when lidar message comes
-        propagate using motion model everytime when odom message comes
+        Cache odometry health and speed.  Particle motion is applied once in
+        update() from exact odom->laser transforms at scan timestamps.
         """
-        position = np.array([msg.pose.pose.position.x, msg.pose.pose.position.y])
-        orientation = Utils.quaternion_to_angle(msg.pose.pose.orientation)
-        pose = np.array([position[0], position[1], orientation])
+        if self.clock_epoch_latch.faulted:
+            return
         self.current_speed = msg.twist.twist.linear.x
-
-        if isinstance(self.last_pose, np.ndarray):
-            # changes in x,y,theta in local coordinate system of the car
-            rot = Utils.rotation_matrix(-self.last_pose[2])
-            delta = np.array([position - self.last_pose[0:2]]).transpose()
-            local_delta = (rot * delta).transpose()
-
-            self.odometry_data = np.array(
-                [local_delta[0, 0], local_delta[0, 1], orientation - self.last_pose[2]]
-            )
-            self.last_pose = pose
-            self.last_stamp = msg.header.stamp
-            self.odom_initialized = True
-        else:
+        self.last_stamp = msg.header.stamp
+        if not self.odom_initialized:
             self.get_logger().info("...Received first Odometry message CB2")
-            self.last_pose = pose
-
-        self.motion_model(self.particles, self.odometry_data)
+        self.odom_initialized = True
 
     def clicked_pose(self, msg):
         """
         Receive pose messages from RViz and initialize the particle distribution in response.
         """
+        if self.clock_epoch_latch.faulted:
+            self.get_logger().error(
+                'Ignoring manual initialization after a clock epoch fault; '
+                'restart PF, lattice_planner, and Pure Pursuit')
+            return
         if isinstance(msg, PointStamped):
             self.initialize_global()
         elif isinstance(msg, PoseWithCovarianceStamped):
-            self.initialize_particles_pose(msg.pose.pose)
+            frame = msg.header.frame_id.lstrip('/')
+            pose = msg.pose.pose
+            values = np.array([
+                pose.position.x, pose.position.y, pose.position.z,
+                pose.orientation.x, pose.orientation.y,
+                pose.orientation.z, pose.orientation.w], dtype=float)
+            quaternion_norm = float(np.linalg.norm(values[3:]))
+            if frame != 'map':
+                self.get_logger().error(
+                    "Ignoring 2D Pose Estimate in frame '%s'; expected 'map'" %
+                    msg.header.frame_id)
+                return
+            if not np.all(np.isfinite(values)) or quaternion_norm < 1e-6:
+                self.get_logger().error(
+                    'Ignoring 2D Pose Estimate with a non-finite or invalid pose')
+                return
+            self.get_logger().info(
+                '2D Pose Estimate accepted; RViz will update immediately and '
+                '/pf/pose will resume on the next exact scan')
+            self.initialize_particles_pose(pose)
+
+    def _reset_scan_epoch(self):
+        """A manual relocalization must not reuse motion from the old pose."""
+        self.last_motion_tf = None
+        self.last_motion_stamp_ns = 0
+        self.estimate_stamp = None
+        self.inferred_pose = None
+        self._health_prev_inferred = None
+        self._gate_prev_odom = None
+        self._jump_gate = JumpGate(
+            float(self.get_parameter('jump_gate_margin_m').value),
+            int(self.get_parameter('jump_gate_max_holds').value))
 
     def initialize_particles_pose(self, pose):
         """
         Initialize particles in the general region of the provided pose.
         """
+        self._reset_scan_epoch()
         self.get_logger().info("SETTING POSE")
         self.get_logger().info(str([pose.position.x, pose.position.y]))
-        self.state_lock.acquire()
-        self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
-        self.particles[:, 0] = pose.position.x + np.random.normal(
-            loc=0.0, scale=0.5, size=self.MAX_PARTICLES
-        )
-        self.particles[:, 1] = pose.position.y + np.random.normal(
-            loc=0.0, scale=0.5, size=self.MAX_PARTICLES
-        )
-        self.particles[:, 2] = Utils.quaternion_to_angle(
-            pose.orientation
-        ) + np.random.normal(loc=0.0, scale=0.4, size=self.MAX_PARTICLES)
-        self.state_lock.release()
+        yaw = Utils.quaternion_to_angle(pose.orientation)
+        with self.state_lock:
+            self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
+            self.particles[:, 0] = pose.position.x + np.random.normal(
+                loc=0.0, scale=0.5, size=self.MAX_PARTICLES
+            )
+            self.particles[:, 1] = pose.position.y + np.random.normal(
+                loc=0.0, scale=0.5, size=self.MAX_PARTICLES
+            )
+            self.particles[:, 2] = yaw + np.random.normal(
+                loc=0.0, scale=0.4, size=self.MAX_PARTICLES)
+        # A manual RViz estimate is an explicit operator reset, not a scan
+        # projection.  Show it immediately using the freshest available
+        # odom->laser transform; normal PF/dynamic-map processing still uses
+        # exact scan timestamps only.
+        self.inferred_pose = np.array([
+            pose.position.x,
+            pose.position.y,
+            yaw])
+        try:
+            odom_to_laser = self.tf_buffer.lookup_transform(
+                'odom', self.LASER_FRAME, rclpy.time.Time(),
+                timeout=Duration(seconds=self.TF_LOOKUP_TIMEOUT))
+        except TransformException as ex:
+            self.get_logger().warn(
+                '2D Pose Estimate stored, but odom -> laser is unavailable: %s' % ex)
+            return
+        self.estimate_stamp = odom_to_laser.header.stamp
+        # This latest-TF lookup is isolated to the explicit operator reset.
+        # Do not publish operational pose/odom until an exact scan epoch has
+        # produced the matching PF/map snapshot.
+        self.publish_tf(
+            self.inferred_pose, self.estimate_stamp, odom_to_laser,
+            publish_odom=False)
+        self.visualize(publish_operational_pose=False)
 
     def initialize_global(self):
         """
         Spread the particle distribution over the permissible region of the state space.
         """
+        self._reset_scan_epoch()
         self.get_logger().info("GLOBAL INITIALIZATION")
         # randomize over grid coordinate space
         self.state_lock.acquire()
@@ -897,8 +977,8 @@ class ParticleFiler(Node):
         if self.SHOW_FINE_TIMING:
             t_propose = time.time()
 
-        # compute the motion model to update the proposal distribution
-        # self.motion_model(proposal_distribution, a)
+        # Motion is one exact odom->laser delta per successful scan epoch.
+        self.motion_model(proposal_distribution, a)
         if self.SHOW_FINE_TIMING:
             t_motion = time.time()
 
@@ -940,12 +1020,97 @@ class ParticleFiler(Node):
         # returns the expected value of the pose given the particle distribution
         return np.dot(self.particles.transpose(), self.weights)
 
-    def update(self):
-        """
-        Apply the MCL function to update particle filter state.
+    @staticmethod
+    def relative_odom_motion(previous, current):
+        p = previous.transform.translation
+        c = current.transform.translation
+        pq = previous.transform.rotation
+        cq = current.transform.rotation
+        previous_yaw = tf_transformations.euler_from_quaternion(
+            [pq.x, pq.y, pq.z, pq.w])[2]
+        current_yaw = tf_transformations.euler_from_quaternion(
+            [cq.x, cq.y, cq.z, cq.w])[2]
+        return np.array(relative_planar_motion(
+            p.x, p.y, previous_yaw, c.x, c.y, current_yaw))
 
-        Ensures the state is correctly initialized, and acquires the state lock before proceeding.
+    def update(self, scan_stamp):
         """
+        Update at the LaserScan epoch only.  Arrival-order odometry is never
+        mixed with a different scan timestamp.
+        """
+        if self.clock_epoch_latch.faulted:
+            return
+        scan_ns = int(scan_stamp.sec) * 1000000000 + int(scan_stamp.nanosec)
+        if scan_ns == 0:
+            self.get_logger().warn('Skipping PF update with zero scan stamp')
+            return
+        if not self.clock_epoch_latch.observe(self.last_motion_stamp_ns, scan_ns):
+            self.inferred_pose = None
+            self.estimate_stamp = None
+            self.last_motion_tf = None
+            self.odom_initialized = False
+            self.get_logger().fatal(
+                'ROS time moved backward; restart PF, lattice_planner, and Pure Pursuit')
+            return
+        if not (self.lidar_initialized and self.odom_initialized and self.map_initialized):
+            return
+        scan_age = (self.get_clock().now().nanoseconds - scan_ns) * 1e-9
+        if time.monotonic() - self._last_latency_log >= 1.0:
+            self.get_logger().info(
+                '[latency] PF scan arrival: %.1f ms' % (scan_age * 1000.0))
+            self._last_latency_log = time.monotonic()
+        if scan_age < -self.MAX_FUTURE_STAMP:
+            self.get_logger().warn(
+                'Skipping PF scan from the future: %.3f s' % scan_age)
+            return
+        if self.last_motion_stamp_ns and scan_ns <= self.last_motion_stamp_ns:
+            self.get_logger().warn('Skipping duplicate/out-of-order scan')
+            return
+        try:
+            odom_to_laser = self.tf_buffer.lookup_transform(
+                'odom', self.LASER_FRAME, rclpy.time.Time.from_msg(scan_stamp),
+                timeout=Duration(seconds=self.TF_LOOKUP_TIMEOUT))
+        except TransformException as ex:
+            if time.monotonic() - self._last_tf_warning >= 1.0:
+                self.get_logger().warn(
+                    'Skipping PF scan: exact odom -> laser transform unavailable: %s' % ex)
+                self._last_tf_warning = time.monotonic()
+            return
+        action = np.zeros(3)
+        if self.last_motion_tf is not None:
+            action = self.relative_odom_motion(self.last_motion_tf, odom_to_laser)
+        if self.state_lock.locked():
+            return
+        with self.state_lock:
+            self.timer.tick()
+            self.iters += 1
+            started = time.time()
+            observation = np.copy(self.downsampled_ranges).astype(np.float32)
+            self.MCL(action, observation)
+            self.inferred_pose = self.expected_pose()
+            self.estimate_stamp = scan_stamp
+            self.last_motion_tf = odom_to_laser
+            self.last_motion_stamp_ns = scan_ns
+            q = odom_to_laser.transform.rotation
+            laser_yaw = tf_transformations.euler_from_quaternion(
+                [q.x, q.y, q.z, q.w])[2]
+            self.last_pose = np.array([
+                odom_to_laser.transform.translation.x,
+                odom_to_laser.transform.translation.y, laser_yaw])
+            if self.JUMP_GATE_ENABLE:
+                gated, held = self._jump_gate.check(
+                    (float(self.inferred_pose[0]), float(self.inferred_pose[1]),
+                     float(self.inferred_pose[2])), float(np.hypot(action[0], action[1])))
+                if held:
+                    self.inferred_pose = np.array(gated)
+            finished = time.time()
+        logger_file.write('%f, %f, %f\n' % tuple(self.inferred_pose))
+        self.publish_tf(self.inferred_pose, scan_stamp, odom_to_laser)
+        self.smoothing.append(1.0 / max(finished - started, 1e-6))
+        self.visualize()
+        return
+
+        # Legacy arrival-order implementation retained below only as reference.
         if self.lidar_initialized and self.odom_initialized and self.map_initialized:
             if self.state_lock.locked():
                 self.get_logger().info("Concurrency error avoided")
@@ -1056,7 +1221,15 @@ def shutdown():
 def main(args=None):
     rclpy.init(args=args)
     pf = ParticleFiler()
-    rclpy.spin(pf)
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(pf)
+    try:
+        executor.spin()
+    finally:
+        executor.shutdown()
+        pf.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
