@@ -52,22 +52,6 @@ def test_operational_pose_is_published_when_visualization_is_disabled():
     assert fake.legacy_pose_pub.messages == []
 
 
-def test_visualize_never_crashes_without_a_timestamp_during_reset():
-    fake = SimpleNamespace(
-        inferred_pose=np.array([1.0, 2.0, 0.3]),
-        estimate_stamp=None,
-        DO_VIZ=True,
-        pose_pub=Recorder(),
-        legacy_pose_pub=Recorder(),
-        get_logger=lambda: Logger(),
-    )
-
-    ParticleFiler.visualize(fake)
-
-    assert fake.pose_pub.messages == []
-    assert fake.legacy_pose_pub.messages == []
-
-
 def test_manual_pose_updates_tf_but_not_scan_synchronized_outputs():
     transform = TransformStamped()
     transform.header.stamp = Time(sec=20, nanosec=50)
@@ -86,12 +70,11 @@ def test_manual_pose_updates_tf_but_not_scan_synchronized_outputs():
         state_lock=Lock(),
         LASER_FRAME='laser',
         TF_LOOKUP_TIMEOUT=0.05,
-        MANUAL_INITIALIZATION_HOLD_SECONDS=2.0,
         tf_buffer=TfBuffer(),
         get_logger=lambda: Logger(),
         _reset_scan_epoch=lambda: calls.append(('reset',)),
         publish_tf=lambda *args, **kwargs: calls.append(
-            ('publish_tf', args, kwargs)) or TransformStamped(),
+            ('publish_tf', args, kwargs)),
         visualize=lambda **kwargs: calls.append(('visualize', kwargs)),
     )
     pose = Pose()
@@ -107,9 +90,6 @@ def test_manual_pose_updates_tf_but_not_scan_synchronized_outputs():
     assert ('visualize', {'publish_operational_pose': False}) in calls
     assert fake.estimate_stamp.sec == 20
     assert np.allclose(fake.inferred_pose, [3.0, -1.0, 0.0])
-    assert np.allclose(fake.manual_laser_pose, [3.0, -1.0, 0.0])
-    assert isinstance(fake.manual_map_to_odom, TransformStamped)
-    assert fake.manual_initialization_until > 0.0
     assert np.isclose(np.sum(fake.weights), 1.0)
 
 
@@ -125,8 +105,6 @@ def test_manual_pose_reset_discards_old_motion_and_health_baselines():
         inferred_pose=np.ones(3),
         _health_prev_inferred=np.ones(3),
         _gate_prev_odom=np.ones(3),
-        manual_laser_pose=np.ones(3),
-        manual_map_to_odom=TransformStamped(),
         get_parameter=lambda name: parameters[name],
     )
 
@@ -138,32 +116,13 @@ def test_manual_pose_reset_discards_old_motion_and_health_baselines():
     assert fake.inferred_pose is None
     assert fake._health_prev_inferred is None
     assert fake._gate_prev_odom is None
-    assert fake.manual_laser_pose is None
-    assert fake.manual_map_to_odom is None
-
-
-def _base_to_laser_transform():
-    transform = TransformStamped()
-    transform.transform.translation.x = 0.165
-    transform.transform.translation.z = 0.110
-    # rear-facing laser mounting
-    transform.transform.rotation.z = 1.0
-    transform.transform.rotation.w = 0.0
-    return transform
 
 
 def test_clicked_pose_accepts_only_valid_map_pose():
     accepted = []
-    transform = _base_to_laser_transform()
     fake = SimpleNamespace(
         clock_epoch_latch=SimpleNamespace(faulted=False),
-        BASE_FRAME='base_link',
-        LASER_FRAME='laser',
-        TF_LOOKUP_TIMEOUT=0.05,
-        tf_buffer=SimpleNamespace(
-            lookup_transform=lambda *_args, **_kwargs: transform),
         get_logger=lambda: Logger(),
-        base_pose_to_laser_pose=ParticleFiler.base_pose_to_laser_pose,
         initialize_particles_pose=lambda pose: accepted.append(pose),
     )
     message = PoseWithCovarianceStamped()
@@ -172,33 +131,11 @@ def test_clicked_pose_accepts_only_valid_map_pose():
     message.pose.pose.orientation.w = 1.0
 
     ParticleFiler.clicked_pose(fake, message)
-    assert len(accepted) == 1
-    assert np.isclose(accepted[0].position.x, 1.165)
-    assert np.isclose(accepted[0].position.y, 0.0)
-    assert np.isclose(accepted[0].orientation.z, 1.0)
+    assert accepted == [message.pose.pose]
 
     message.header.frame_id = 'odom'
     ParticleFiler.clicked_pose(fake, message)
-    assert len(accepted) == 1
-
-
-def test_base_pose_is_converted_to_internal_laser_pose():
-    base_pose = Pose()
-    base_pose.position.x = 1.0
-    base_pose.position.y = 2.0
-    # map->base yaw +90 degrees
-    base_pose.orientation.z = np.sqrt(0.5)
-    base_pose.orientation.w = np.sqrt(0.5)
-
-    laser_pose = ParticleFiler.base_pose_to_laser_pose(
-        base_pose, _base_to_laser_transform())
-
-    # Offset (0.165, 0) is rotated with the base, so it points +y in map.
-    assert np.isclose(laser_pose.position.x, 1.0)
-    assert np.isclose(laser_pose.position.y, 2.165)
-    # +90 degree base heading plus rear-facing (+180) laser mounting = -90.
-    assert np.isclose(laser_pose.orientation.z, np.sqrt(0.5), atol=1e-6)
-    assert np.isclose(laser_pose.orientation.w, -np.sqrt(0.5), atol=1e-6)
+    assert accepted == [message.pose.pose]
 
 
 def test_manual_pose_cannot_clear_latched_clock_fault():
