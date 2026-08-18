@@ -11,14 +11,12 @@ from particle_filter.time_sync import (
 )
 
 
-def test_relative_motion_is_expressed_in_previous_sensor_frame():
-    # A rear-facing laser has yaw pi.  Vehicle-forward world motion therefore
-    # appears as negative local laser-x and is rotated back correctly by MCL.
+def test_vehicle_forward_motion_is_positive_in_previous_base_frame():
     dx, dy, dyaw = relative_planar_motion(
-        0.0, 0.0, math.pi,
-        1.0, 0.0, math.pi,
+        0.0, 0.0, 0.0,
+        1.0, 0.0, 0.0,
     )
-    assert dx == pytest.approx(-1.0)
+    assert dx == pytest.approx(1.0)
     assert dy == pytest.approx(0.0, abs=1e-12)
     assert dyaw == pytest.approx(0.0)
 
