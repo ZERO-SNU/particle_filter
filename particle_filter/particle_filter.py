@@ -113,6 +113,7 @@ class ParticleFiler(Node):
         self.declare_parameter("odometry_topic")
         self.declare_parameter("laser_frame", "laser")
         self.declare_parameter("base_frame", "base_link")
+        self.declare_parameter("manual_initialization_hold_seconds", 2.0)
         self.declare_parameter("tf_lookup_timeout", 0.05)
         self.declare_parameter("max_future_stamp", 0.05)
         self.declare_parameter("clock_reset_threshold", 1.0)
@@ -142,6 +143,9 @@ class ParticleFiler(Node):
         self.SCAN_ROTATE_180 = self.get_parameter("scan_rotate_180").value
         self.LASER_FRAME = str(self.get_parameter("laser_frame").value)
         self.BASE_FRAME = str(self.get_parameter("base_frame").value)
+        self.MANUAL_INITIALIZATION_HOLD_SECONDS = max(
+            0.0, float(self.get_parameter(
+                "manual_initialization_hold_seconds").value))
         self.TF_LOOKUP_TIMEOUT = float(self.get_parameter("tf_lookup_timeout").value)
         self.MAX_FUTURE_STAMP = float(self.get_parameter("max_future_stamp").value)
         self.clock_epoch_latch = ClockEpochLatch(
@@ -192,6 +196,7 @@ class ParticleFiler(Node):
         self._last_latency_log = 0.0
         self.manual_laser_pose = None
         self.manual_map_to_odom = None
+        self.manual_initialization_until = 0.0
         self.first_sensor_update = True
         self.state_lock = Lock()
 
@@ -495,6 +500,11 @@ class ParticleFiler(Node):
                 "Skipping scan frame '%s'; expected '%s'" % (
                     msg.header.frame_id, self.LASER_FRAME))
             return
+        if self._manual_initialization_active():
+            # A 2D Pose Estimate is an operator-requested reset.  Do not let
+            # buffered scans from the pre-click epoch immediately pull the new
+            # cloud back to its old solution.
+            return
         if not isinstance(self.laser_angles, np.ndarray):
             self.get_logger().info("...Received first LiDAR message")
             self.laser_angles = np.linspace(
@@ -565,6 +575,11 @@ class ParticleFiler(Node):
         update() from exact odom->laser transforms at scan timestamps.
         """
         if self.clock_epoch_latch.faulted:
+            return
+        if self._manual_initialization_active():
+            # Keep the RViz map->odom anchor current, but deliberately do not
+            # change PF odometry state during the reset window.
+            self._refresh_manual_map_to_odom(msg.header.stamp)
             return
         self.current_speed = msg.twist.twist.linear.x
         self.last_stamp = msg.header.stamp
@@ -645,6 +660,7 @@ class ParticleFiler(Node):
         self.inferred_pose = None
         self.manual_laser_pose = None
         self.manual_map_to_odom = None
+        self.manual_initialization_until = 0.0
         self._health_prev_inferred = None
         self._gate_prev_odom = None
         self._jump_gate = JumpGate(
@@ -678,6 +694,12 @@ class ParticleFiler(Node):
             pose.position.y,
             yaw])
         self.manual_laser_pose = np.copy(self.inferred_pose)
+        self.manual_initialization_until = (
+            time.monotonic() + self.MANUAL_INITIALIZATION_HOLD_SECONDS)
+        self.get_logger().info(
+            '2D Pose Estimate reset: holding PF scan/odom updates for %.1f s; '
+            'then localizing around the clicked pose' %
+            self.MANUAL_INITIALIZATION_HOLD_SECONDS)
         try:
             odom_to_laser = self.tf_buffer.lookup_transform(
                 'odom', self.LASER_FRAME, rclpy.time.Time(),
@@ -714,6 +736,9 @@ class ParticleFiler(Node):
             return
         self.manual_map_to_odom.header.stamp = odom_stamp
         self.pub_tf.sendTransform(self.manual_map_to_odom)
+
+    def _manual_initialization_active(self):
+        return time.monotonic() < self.manual_initialization_until
 
     def initialize_global(self):
         """

@@ -4,6 +4,10 @@ particle_filter:
     scan_topic: "/scan"
     odometry_topic: "/odom"   # 정본 계약(30_SIM_REAL_PARITY §3). 시뮬은 gym launch가 /odom으로 리맵
     laser_frame: "laser"
+    # RViz 2D Pose Estimate resets the cloud at the clicked map->base_link
+    # pose, then ignores pre-click scan/odom callbacks briefly before the
+    # first new scan performs MCL around that seed.
+    manual_initialization_hold_seconds: 2.0
     tf_lookup_timeout: 0.05
     max_future_stamp: 0.05
     clock_reset_threshold: 1.0

@@ -70,6 +70,7 @@ def test_manual_pose_updates_tf_but_not_scan_synchronized_outputs():
         state_lock=Lock(),
         LASER_FRAME='laser',
         TF_LOOKUP_TIMEOUT=0.05,
+        MANUAL_INITIALIZATION_HOLD_SECONDS=2.0,
         tf_buffer=TfBuffer(),
         get_logger=lambda: Logger(),
         _reset_scan_epoch=lambda: calls.append(('reset',)),
@@ -92,6 +93,7 @@ def test_manual_pose_updates_tf_but_not_scan_synchronized_outputs():
     assert np.allclose(fake.inferred_pose, [3.0, -1.0, 0.0])
     assert np.allclose(fake.manual_laser_pose, [3.0, -1.0, 0.0])
     assert isinstance(fake.manual_map_to_odom, TransformStamped)
+    assert fake.manual_initialization_until > 0.0
     assert np.isclose(np.sum(fake.weights), 1.0)
 
 
