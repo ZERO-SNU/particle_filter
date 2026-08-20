@@ -126,6 +126,17 @@ class ParticleFiler(Node):
         self.declare_parameter("jump_gate_enable", False)
         self.declare_parameter("jump_gate_margin_m", 0.5)
         self.declare_parameter("jump_gate_max_holds", 5)
+        # [PF 개선안 ①, 2026-08-19] n_eff 게이팅 리샘플링 — 매 스텝 무조건 리샘플하면
+        # 정보 부족 구간(편측 벽 소실 + 최대곡률 겹침 등)에서 약한 우도 편향이
+        # 수십~수백 사이클 동안 그대로 복제돼 파티클이 고갈된다("particle deprivation").
+        # n_eff_ratio가 이 값 이상이면(=아직 다양성 충분) 리샘플을 건너뛰고, 그 스텝의
+        # 파티클 집합을 그대로 유지한 채 센서모델만 새로 평가한다(모션모델은 odom 콜백에서
+        # 비동기로 계속 적용됨 — motion_model 참조). eval_sensor_model이 self.weights를
+        # 매 스텝 덮어쓰는(누적 아님) 구조라 스킵해도 이번 스텝 우도 평가 자체는 정상이다.
+        # 되돌리기: 0.0 (또는 이하) — 매 스텝 무조건 리샘플하는 기존 동작.
+        # [실차 미검증] — map0815 특정 코너(s≈21.5~24.6m, drift_scale 등 실측 근거는
+        # eval/ 하네스 pf_baseline_0819_1938 분석 참조) 재현 주행으로 확인 필요.
+        self.declare_parameter("resample_neff_thresh", 0.5)
 
         # parameters
         self.ANGLE_STEP = self.get_parameter("angle_step").value
@@ -162,6 +173,8 @@ class ParticleFiler(Node):
         self._jump_gate = JumpGate(
             float(self.get_parameter("jump_gate_margin_m").value),
             int(self.get_parameter("jump_gate_max_holds").value))
+        self.RESAMPLE_NEFF_THRESH = float(
+            self.get_parameter("resample_neff_thresh").value)
         self._gate_prev_odom = None
         self._health_prev_inferred = None
         self._health_raw_w_mean = 0.0
@@ -959,27 +972,40 @@ class ParticleFiler(Node):
         """
         if self.SHOW_FINE_TIMING:
             t = time.time()
-        # draw the proposal distribution from the old particles
-        # [Orin 최적화] multinomial(np.random.choice) → systematic resampling + 사전할당 버퍼.
-        # 동일 확률분포에서 저분산 추출, 배열 신규 할당 없음 (08-15 실차 검증 2.97배 단축)
-        np.cumsum(self.weights, out=self._resample_cdf)
-        self._resample_cdf[-1] = 1.0
-        np.add(
-            self._resample_base,
-            np.random.random() / float(self.MAX_PARTICLES),
-            out=self._resample_positions,
-        )
-        proposal_indices = np.searchsorted(
-            self._resample_cdf, self._resample_positions, side="left"
-        )
-        np.take(
-            self.particles,
-            proposal_indices,
-            axis=0,
-            out=self._resample_particles,
-            mode="clip",
-        )
-        proposal_distribution = self._resample_particles
+
+        # [PF 개선안 ①] n_eff 게이팅 — 아직 다양성이 충분하면 이번 스텝 리샘플을 건너뛴다.
+        # self.weights는 지난 스텝 정규화된 값 그대로다(이번 스텝에서 아직 안 건드림).
+        ssq = float(np.dot(self.weights, self.weights))
+        neff = 1.0 / (self.MAX_PARTICLES * ssq) if ssq > 0.0 else 0.0
+        do_resample = (self.RESAMPLE_NEFF_THRESH <= 0.0) or (neff < self.RESAMPLE_NEFF_THRESH)
+
+        if do_resample:
+            # draw the proposal distribution from the old particles
+            # [Orin 최적화] multinomial(np.random.choice) → systematic resampling + 사전할당 버퍼.
+            # 동일 확률분포에서 저분산 추출, 배열 신규 할당 없음 (08-15 실차 검증 2.97배 단축)
+            np.cumsum(self.weights, out=self._resample_cdf)
+            self._resample_cdf[-1] = 1.0
+            np.add(
+                self._resample_base,
+                np.random.random() / float(self.MAX_PARTICLES),
+                out=self._resample_positions,
+            )
+            proposal_indices = np.searchsorted(
+                self._resample_cdf, self._resample_positions, side="left"
+            )
+            np.take(
+                self.particles,
+                proposal_indices,
+                axis=0,
+                out=self._resample_particles,
+                mode="clip",
+            )
+            proposal_distribution = self._resample_particles
+        else:
+            # 리샘플 스킵 — 파티클을 그대로 제안분포로 쓴다(모션모델은 odom 콜백에서
+            # 비동기로 이미 적용돼 위치가 갱신돼 있음). self._resample_particles 버퍼는
+            # 건드리지 않는다 — 다음에 리샘플할 때 self.particles와 별개 버퍼여야 한다.
+            proposal_distribution = self.particles
         if self.SHOW_FINE_TIMING:
             t_propose = time.time()
 
@@ -1017,10 +1043,14 @@ class ParticleFiler(Node):
             )
 
         # save the particles — 버퍼 스왑 (proposal은 _resample_particles를 가리키므로 재할당 없이 교대)
-        self.particles, self._resample_particles = (
-            proposal_distribution,
-            self.particles,
-        )
+        # do_resample=False면 proposal_distribution이 이미 self.particles 그 자체이므로
+        # 스왑하면 안 된다 — 스왑하면 self._resample_particles가 self.particles와
+        # 같은 배열을 가리키게 돼(별칭) 다음 리샘플 때 np.take(out=...)가 원본을 훼손한다.
+        if do_resample:
+            self.particles, self._resample_particles = (
+                proposal_distribution,
+                self.particles,
+            )
 
     def expected_pose(self):
         # returns the expected value of the pose given the particle distribution

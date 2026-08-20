@@ -67,9 +67,19 @@ class DriftWindow:
         self._last_odom = tuple(odom_pose)
 
     def drift(self):
-        """(drift_scale, drift_yaw_rad). 창이 아직 짧으면(정지·초기) scale=1.0."""
+        """(drift_scale, drift_yaw_rad). 창이 아직 짧으면(정지·초기) scale=NaN.
+
+        [2026-08-20 수정] 예전엔 여기서 1.0을 반환했다 — "측정 안 됨"과
+        "비율이 정확히 1.0으로 측정됨"이 같은 값이 돼버려서, 정차 구간이 섞인
+        bag에서는 그 1.0들이 중앙값을 끌어당겨 "게인이 잘 맞는다"는 가짜 신호를
+        만든다 (pf_baseline_0819_1938: 33%가 이 센티넬, 나머지 중앙값은 0.988이지만
+        p05~p95가 0.48~1.53으로 벌어져 있어 그마저도 이 bag만으로는 못 믿는다).
+        eval/의 원칙("못 잰 것은 0이 아니라 거부다")과 같은 이유로 NaN 반환 —
+        소비자(eval/metrics/health.py는 np.isfinite로 이미 거른다)가 결측으로
+        처리하게 한다.
+        """
         if self._odom_sum < 0.5:       # 이동이 거의 없으면 비율이 무의미
-            return 1.0, self._yaw_sum
+            return math.nan, self._yaw_sum
         return self._pf_sum / self._odom_sum, self._yaw_sum
 
 
