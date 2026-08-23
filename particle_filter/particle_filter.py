@@ -126,6 +126,12 @@ class ParticleFiler(Node):
         self.declare_parameter("jump_gate_enable", False)
         self.declare_parameter("jump_gate_margin_m", 0.5)
         self.declare_parameter("jump_gate_max_holds", 5)
+        # [08-24] hold 중 last-good 처리: 'freeze'(구 동작, 기본) | 'dead_reckon'.
+        # freeze 는 hold 가 시작되면 차가 움직이는 한 max_holds 까지 반드시 얼고 누적분을
+        # 한 번에 점프한다(car1 4.3 m/s: 0.4 s 동결 → 2.93 m 순간이동). dead_reckon 은
+        # hold 중 발행 pose 를 odom 으로 전진시켜 동결이 없고 풀릴 때 점프가 원래 오차만큼만.
+        # 차량별 거동 보존을 위해 기본은 freeze — car1 프로파일(particle_filter: 섹션)에서 켠다.
+        self.declare_parameter("jump_gate_hold_mode", "freeze")
 
         # parameters
         self.ANGLE_STEP = self.get_parameter("angle_step").value
@@ -161,7 +167,8 @@ class ParticleFiler(Node):
         self.JUMP_GATE_ENABLE = bool(self.get_parameter("jump_gate_enable").value)
         self._jump_gate = JumpGate(
             float(self.get_parameter("jump_gate_margin_m").value),
-            int(self.get_parameter("jump_gate_max_holds").value))
+            int(self.get_parameter("jump_gate_max_holds").value),
+            str(self.get_parameter("jump_gate_hold_mode").value))
         self._gate_prev_odom = None
         self._health_prev_inferred = None
         self._health_raw_w_mean = 0.0
@@ -606,7 +613,8 @@ class ParticleFiler(Node):
         self._gate_prev_odom = None
         self._jump_gate = JumpGate(
             float(self.get_parameter('jump_gate_margin_m').value),
-            int(self.get_parameter('jump_gate_max_holds').value))
+            int(self.get_parameter('jump_gate_max_holds').value),
+            str(self.get_parameter('jump_gate_hold_mode').value))
 
     def initialize_particles_pose(self, pose):
         """
@@ -1103,7 +1111,8 @@ class ParticleFiler(Node):
             if self.JUMP_GATE_ENABLE:
                 gated, held = self._jump_gate.check(
                     (float(self.inferred_pose[0]), float(self.inferred_pose[1]),
-                     float(self.inferred_pose[2])), float(np.hypot(action[0], action[1])))
+                     float(self.inferred_pose[2])), float(np.hypot(action[0], action[1])),
+                    action=(float(action[0]), float(action[1]), float(action[2])))
                 if held:
                     self.inferred_pose = np.array(gated)
             finished = time.time()

@@ -50,6 +50,7 @@ particle_filter:
     jump_gate_enable: true
     jump_gate_margin_m: 0.5
     jump_gate_max_holds: 5
+    jump_gate_hold_mode: freeze   # [08-24] freeze(구 동작) | dead_reckon — hold 중 발행 pose 를 odom 으로 전진. 차량별 값은 vehicles/<ID>.yaml particle_filter: 섹션
 
 map_server:
   ros__parameters:
