@@ -44,6 +44,7 @@ particle_filter:
     # [n_eff_ratio, mean_likelihood, pose_jump_m, drift_scale, drift_yaw_rad]
     # drift_scale≠1 지속 = speed_to_erpm_gain 재보정 신호 (OPERATIONS §3-5)
     publish_health: true
+    health_warn_neff: 0.10        # [08-24] N_eff비가 이 값 아래면 발산 의심 WARN. 0=끔
     health_window_m: 5.0
     # [P0-5] pose 점프 게이트 — false=끔(기존 동작). 켜면 물리 불가능 점프 시
     # last-good 유지(연속 max_holds 초과 시 새 추정 수용). 실차 검증 후 기본 전환 검토.

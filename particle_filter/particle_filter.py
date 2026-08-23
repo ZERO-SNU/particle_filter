@@ -119,6 +119,8 @@ class ParticleFiler(Node):
         self.declare_parameter("clock_reset_threshold", 1.0)
         # [P0-3] 헬스 지표 발행 — 주행 로직 무영향(발행만). Phase 3 FSM·재보정 감지 입력.
         self.declare_parameter("publish_health", True)
+        # [08-24] N_eff비가 이 값 아래로 내려가면 발산 의심 경고. 0 = 끔.
+        self.declare_parameter("health_warn_neff", 0.10)
         self.declare_parameter("health_window_m", 5.0)
         # [P0-5] pose 점프 게이트 — 물리 불가능 점프(odom 이동량+margin 초과) 시
         # last-good pose를 유지 발행. false = 끔(기존 동작). 파티클·가중치는 건드리지
@@ -163,6 +165,7 @@ class ParticleFiler(Node):
 
         # motion model constants
         self.PUBLISH_HEALTH = bool(self.get_parameter("publish_health").value)
+        self.HEALTH_WARN_NEFF = float(self.get_parameter("health_warn_neff").value)
         self._health_window = DriftWindow(float(self.get_parameter("health_window_m").value))
         self.JUMP_GATE_ENABLE = bool(self.get_parameter("jump_gate_enable").value)
         self._jump_gate = JumpGate(
@@ -338,7 +341,20 @@ class ParticleFiler(Node):
         elif self.WHICH_RM == "rm":
             self.range_method = range_libc.PyRayMarching(oMap, self.MAX_RANGE_PX)
         elif self.WHICH_RM == "rmgpu":
-            self.range_method = range_libc.PyRayMarchingGPU(oMap, self.MAX_RANGE_PX)
+            # [08-24] GPU 레이마칭 실패 시 **CPU 로 안전 강등**한다.
+            # 이전에는 예외가 그대로 올라가 PF 가 아예 안 떴다 — 대회장에서 GPU rangelib
+            # 이 빌드돼 있지 않거나 CUDA 가 안 잡히면 측위 자체가 죽는다는 뜻이다.
+            # 강등은 조용히 하지 않는다(성능이 크게 달라지므로 반드시 로그로 남긴다).
+            try:
+                self.range_method = range_libc.PyRayMarchingGPU(oMap, self.MAX_RANGE_PX)
+            except Exception as ex:                              # noqa: BLE001
+                self.get_logger().error(
+                    'rmgpu(PyRayMarchingGPU) 초기화 실패 — CPU rm 으로 강등한다: %r. '
+                    'GPU 를 쓰려면 scripts/install_rangelib_orin_sm87.sh 로 range_libc 를 '
+                    '다시 빌드할 것. 강등 상태에서는 max_particles·angle_step 을 GPU 값 '
+                    '그대로 두면 PF 가 스캔 속도를 못 따라간다.' % (ex,))
+                self.WHICH_RM = "rm"
+                self.range_method = range_libc.PyRayMarching(oMap, self.MAX_RANGE_PX)
         elif self.WHICH_RM == "glt":
             self.range_method = range_libc.PyGiantLUTCast(
                 oMap, self.MAX_RANGE_PX, self.THETA_DISCRETIZATION
@@ -1043,6 +1059,41 @@ class ParticleFiler(Node):
         return np.array(relative_planar_motion(
             p.x, p.y, previous_yaw, c.x, c.y, current_yaw))
 
+    def _publish_health(self):
+        """[P0-3] /pf/health 발행 + 발산 자가 경고.
+
+        data = [N_eff비, 평균 likelihood, 직전 추정 대비 점프[m], drift_scale, drift_yaw]
+        (레이아웃은 pf_health.py). 08-24 이전에는 도달 불가 코드에 있어 한 번도 안 나갔다."""
+        if not self.PUBLISH_HEALTH or self.inferred_pose is None:
+            return
+        jump = 0.0
+        if self._health_prev_inferred is not None:
+            jump = float(np.hypot(
+                self.inferred_pose[0] - self._health_prev_inferred[0],
+                self.inferred_pose[1] - self._health_prev_inferred[1]))
+        self._health_prev_inferred = np.copy(self.inferred_pose)
+        if self.last_pose is not None:
+            self._health_window.push(
+                (float(self.inferred_pose[0]), float(self.inferred_pose[1]),
+                 float(self.inferred_pose[2])),
+                (float(self.last_pose[0]), float(self.last_pose[1]),
+                 float(self.last_pose[2])))
+        scale, dyaw = self._health_window.drift()
+        neff = float(n_eff_ratio(self.weights))
+        m = Float32MultiArray()
+        m.data = [neff, float(self._health_raw_w_mean), jump, float(scale), float(dyaw)]
+        self.health_pub.publish(m)
+
+        # 발산 자가 경고 — N_eff 가 바닥이면 파티클이 한 점에 몰려 다른 가설을 못 본다.
+        # 이 맵은 주행선 2 m 안이 28~78% 미탐사라 우도가 다봉이고(1~3 m 떨어진 봉우리
+        # 5개 실측), 한 번 엉뚱한 봉우리로 가면 스스로 못 빠져나온다. 소리는 내야 한다.
+        if self.HEALTH_WARN_NEFF > 0.0 and neff < self.HEALTH_WARN_NEFF:
+            self.get_logger().warn(
+                'PF 발산 의심: N_eff비 %.3f < %.3f — 추정이 한 가설에 갇혔을 수 있다. '
+                '맵 미탐사 구간에서는 잘못된 자리에도 스캔이 맞는다(자기모순 없음). '
+                '속도를 줄이고 RViz 로 위치를 확인할 것.' % (neff, self.HEALTH_WARN_NEFF),
+                throttle_duration_sec=2.0)
+
     def update(self, scan_stamp):
         """
         Update at the LaserScan epoch only.  Arrival-order odometry is never
@@ -1114,12 +1165,22 @@ class ParticleFiler(Node):
                      float(self.inferred_pose[2])), float(np.hypot(action[0], action[1])),
                     action=(float(action[0]), float(action[1]), float(action[2])))
                 if held:
+                    self.get_logger().warn(
+                        'pose 점프 게이트: 추정 점프 차단 — last-good 유지 (연속 %d회, %s)'
+                        % (self._jump_gate._holds, self._jump_gate.hold_mode),
+                        throttle_duration_sec=1.0)
                     self.inferred_pose = np.array(gated)
             finished = time.time()
             # Keep outputs in the same transaction as MCL so the manual
             # callback cannot reset stamp/pose between calculation and RViz.
             logger_file.write('%f, %f, %f\n' % tuple(self.inferred_pose))
             self.publish_tf(self.inferred_pose, scan_stamp, odom_to_base)
+            # [08-24 결함 수정] 헬스 발행이 아래 **도달 불가** 구간(구 arrival-order 코드)에만
+            # 있어서 `/pf/health` 가 한 번도 나가지 않았다 — 실차 백 15개 전부 0건.
+            # 그래서 08-21 이후 "PF 발산을 /pf/health 로 판단하라"는 절차가 통째로 무력했고,
+            # PP_problem_retry(car6) 처럼 PF 가 2 m 어긋난 채 자기모순 없이(fit 0.83) 계속
+            # 달리는 상황을 아무도 감지하지 못했다. 살아 있는 경로로 옮긴다.
+            self._publish_health()
             self.smoothing.append(1.0 / max(finished - started, 1e-6))
             self.visualize()
         return
